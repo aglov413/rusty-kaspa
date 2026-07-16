@@ -43,6 +43,13 @@ const VARDIFF_UPPER_RATIO: f64 = 1.25; // above this => increase diff
 const VARDIFF_MAX_STEP_UP: f64 = 2.0; // max 2x per adjustment tick
 const VARDIFF_MAX_STEP_DOWN: f64 = 0.5; // max -50% per adjustment tick
 
+// Variable-diff-mode tunables (only used when min_share_diff: variable). Existing static/var_diff
+// behaviour is unaffected — these gate the expanding dead band and the early forced-drop path.
+const VARDIFF_MAX_ELAPSED_SECS_NO_SHARES_VARIABLE: f64 = 60.0; // idle-drop sooner than the 90s default
+const VARDIFF_FORCED_DROP_MULTIPLIER: f64 = 0.25; // 2 pow2 steps down per forced drop
+const VARDIFF_NO_VALID_SHARE_SECS: f64 = 60.0; // no-valid-share timeout before a forced drop
+const VARDIFF_FORCED_DROP_MAX: u32 = 1; // max forced drops per worker session
+
 fn vardiff_pow2_clamp_towards(current: f64, next: f64) -> f64 {
     if !next.is_finite() || next <= 0.0 {
         return 1.0;
@@ -53,7 +60,29 @@ fn vardiff_pow2_clamp_towards(current: f64, next: f64) -> f64 {
     if clamped < 1.0 { 1.0 } else { clamped }
 }
 
-fn vardiff_compute_next_diff(current: f64, shares: f64, elapsed_secs: f64, expected_spm: f64, clamp_pow2: bool) -> Option<f64> {
+/// Forced-drop difficulty for variable mode: applied when no valid share has arrived within
+/// VARDIFF_NO_VALID_SHARE_SECS during the first 120s of a session. Uses a more aggressive
+/// multiplier than a normal tick to quickly bring a stuck new miner to a reachable diff.
+/// Returns None if `current` is invalid or already at the floor (1.0).
+fn vardiff_forced_drop(current: f64, clamp_pow2: bool) -> Option<f64> {
+    if !current.is_finite() || current <= 0.0 {
+        return None;
+    }
+    let mut next = (current * VARDIFF_FORCED_DROP_MULTIPLIER).max(1.0);
+    if clamp_pow2 {
+        next = vardiff_pow2_clamp_towards(current, next);
+    }
+    if (next - current).abs() > f64::EPSILON { Some(next) } else { None }
+}
+
+fn vardiff_compute_next_diff(
+    current: f64,
+    shares: f64,
+    elapsed_secs: f64,
+    expected_spm: f64,
+    clamp_pow2: bool,
+    variable: bool,
+) -> Option<f64> {
     if !current.is_finite() || current <= 0.0 {
         return None;
     }
@@ -61,7 +90,9 @@ fn vardiff_compute_next_diff(current: f64, shares: f64, elapsed_secs: f64, expec
         return None;
     }
 
-    if shares == 0.0 && elapsed_secs >= VARDIFF_MAX_ELAPSED_SECS_NO_SHARES {
+    // Variable mode drops idle miners sooner (60s) than the default (90s).
+    let no_share_threshold = if variable { VARDIFF_MAX_ELAPSED_SECS_NO_SHARES_VARIABLE } else { VARDIFF_MAX_ELAPSED_SECS_NO_SHARES };
+    if shares == 0.0 && elapsed_secs >= no_share_threshold {
         let mut next = current * VARDIFF_MAX_STEP_DOWN;
         if next < 1.0 {
             next = 1.0;
@@ -81,7 +112,16 @@ fn vardiff_compute_next_diff(current: f64, shares: f64, elapsed_secs: f64, expec
     if !ratio.is_finite() || ratio <= 0.0 {
         return None;
     }
-    if ratio > VARDIFF_LOWER_RATIO && ratio < VARDIFF_UPPER_RATIO {
+    // Variable mode expands the lower dead band over time (0.75 -> 0.60 across 30-120s) so stable
+    // miners are not stepped down for minor undershoot; the upper bound stays fixed so persistent
+    // overshoot always triggers a step-up. Non-variable mode keeps the original fixed band.
+    let (lower, upper) = if variable {
+        let extra = ((elapsed_secs - VARDIFF_MIN_ELAPSED_SECS) / 30.0).clamp(0.0, 3.0) * 0.05;
+        (VARDIFF_LOWER_RATIO - extra, VARDIFF_UPPER_RATIO)
+    } else {
+        (VARDIFF_LOWER_RATIO, VARDIFF_UPPER_RATIO)
+    };
+    if ratio > lower && ratio < upper {
         return None;
     }
 
@@ -140,6 +180,8 @@ pub struct WorkStats {
     pub var_diff_shares_found: Arc<Mutex<i64>>,
     pub var_diff_window: Arc<Mutex<usize>>,
     pub min_diff: Arc<Mutex<f64>>,
+    /// Number of variable-diff forced drops fired for this worker (capped at VARDIFF_FORCED_DROP_MAX).
+    pub forced_drop_count: Arc<Mutex<u32>>,
 }
 
 impl WorkStats {
@@ -157,6 +199,7 @@ impl WorkStats {
             var_diff_shares_found: Arc::new(Mutex::new(0)),
             var_diff_window: Arc::new(Mutex::new(0)),
             min_diff: Arc::new(Mutex::new(0.0)),
+            forced_drop_count: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -1549,8 +1592,8 @@ impl ShareHandler {
         });
     }
 
-    pub fn start_vardiff_thread(&self, _expected_share_rate: u32, _log_stats: bool, _clamp: bool) {
-        self.start_vardiff_thread_impl(_expected_share_rate, _log_stats, _clamp, None);
+    pub fn start_vardiff_thread(&self, _expected_share_rate: u32, _log_stats: bool, _clamp: bool, _variable_diff: bool) {
+        self.start_vardiff_thread_impl(_expected_share_rate, _log_stats, _clamp, _variable_diff, None);
     }
 
     pub fn start_vardiff_thread_with_shutdown(
@@ -1558,9 +1601,10 @@ impl ShareHandler {
         expected_share_rate: u32,
         log_stats: bool,
         clamp: bool,
+        variable_diff: bool,
         shutdown_rx: watch::Receiver<bool>,
     ) {
-        self.start_vardiff_thread_impl(expected_share_rate, log_stats, clamp, Some(shutdown_rx));
+        self.start_vardiff_thread_impl(expected_share_rate, log_stats, clamp, variable_diff, Some(shutdown_rx));
     }
 
     fn start_vardiff_thread_impl(
@@ -1568,6 +1612,7 @@ impl ShareHandler {
         expected_share_rate: u32,
         log_stats: bool,
         clamp: bool,
+        variable_diff: bool,
         mut shutdown_rx: Option<watch::Receiver<bool>>,
     ) {
         let stats = Arc::clone(&self.stats);
@@ -1610,10 +1655,48 @@ impl ShareHandler {
                     let start_opt = *v.var_diff_start_time.lock();
                     let Some(start) = start_opt else { continue };
 
+                    // Variable-diff forced drop: within the first 120s of a session, if no valid share
+                    // has arrived for VARDIFF_NO_VALID_SHARE_SECS, drop aggressively (2 pow2 steps) up
+                    // to VARDIFF_FORCED_DROP_MAX times, to unstick a miner seeded too high (e.g. 16384).
+                    // last_share only advances on accepted shares, so stales/invalids do not reset it.
+                    if variable_diff {
+                        let session_secs = now.duration_since(v.start_time).as_secs_f64();
+                        let secs_since_last_share = now.duration_since(*v.last_share.lock()).as_secs_f64();
+                        let drop_count = *v.forced_drop_count.lock();
+                        if session_secs < 120.0
+                            && drop_count < VARDIFF_FORCED_DROP_MAX
+                            && secs_since_last_share >= VARDIFF_NO_VALID_SHARE_SECS
+                        {
+                            let current = *v.min_diff.lock();
+                            if let Some(next) = vardiff_forced_drop(current, clamp) {
+                                *v.min_diff.lock() = next;
+                                if log_stats {
+                                    let worker = v.worker_name.lock().clone();
+                                    info!(
+                                        "{} VarDiff forced drop [{}/{}]: worker={} no valid share for {:.0}s, diff {:.0} -> {:.0}",
+                                        prefix,
+                                        drop_count + 1,
+                                        VARDIFF_FORCED_DROP_MAX,
+                                        worker,
+                                        secs_since_last_share,
+                                        current,
+                                        next
+                                    );
+                                }
+                            }
+                            *v.forced_drop_count.lock() += 1;
+                            // Reset the window and skip normal vardiff logic for this tick.
+                            *v.var_diff_start_time.lock() = Some(now);
+                            *v.var_diff_shares_found.lock() = 0;
+                            *v.var_diff_window.lock() = 0;
+                            continue;
+                        }
+                    }
+
                     let elapsed = now.duration_since(start).as_secs_f64().max(0.0);
                     let shares = *v.var_diff_shares_found.lock() as f64;
                     let current = *v.min_diff.lock();
-                    let next_opt = vardiff_compute_next_diff(current, shares, elapsed, expected_spm, clamp);
+                    let next_opt = vardiff_compute_next_diff(current, shares, elapsed, expected_spm, clamp, variable_diff);
                     let Some(next) = next_opt else { continue };
 
                     *v.min_diff.lock() = next;

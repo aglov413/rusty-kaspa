@@ -22,6 +22,9 @@ pub struct BridgeConfig {
     pub health_check_port: String,
     pub block_wait_time: Duration,
     pub min_share_diff: u32,
+    /// Tuned variable-difficulty mode (set when `min_share_diff: variable`). Gates the expanding
+    /// dead band and the early forced-drop path; existing var_diff/static behaviour is unchanged.
+    pub variable_diff: bool,
     pub var_diff: bool,
     pub shares_per_min: u32,
     pub var_diff_stats: bool,
@@ -190,9 +193,15 @@ async fn listen_and_serve_impl<T: KaspaApiTrait + Send + Sync + 'static>(
     if config.var_diff {
         let shares_per_min = if config.shares_per_min > 0 { config.shares_per_min } else { 20 };
         if let Some(rx) = shutdown_rx_for_bg.as_ref().cloned() {
-            share_handler.start_vardiff_thread_with_shutdown(shares_per_min, config.var_diff_stats, config.pow2_clamp, rx);
+            share_handler.start_vardiff_thread_with_shutdown(
+                shares_per_min,
+                config.var_diff_stats,
+                config.pow2_clamp,
+                config.variable_diff,
+                rx,
+            );
         } else {
-            share_handler.start_vardiff_thread(shares_per_min, config.var_diff_stats, config.pow2_clamp);
+            share_handler.start_vardiff_thread(shares_per_min, config.var_diff_stats, config.pow2_clamp, config.variable_diff);
         }
     }
 

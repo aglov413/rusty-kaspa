@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kaspa_stratum_bridge::{BridgeConfig, InstanceConfig, net_utils::normalize_port};
+use kaspa_stratum_bridge::{BridgeConfig, InstanceConfig, MinShareDiff, net_utils::normalize_port};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum NodeMode {
@@ -25,7 +25,8 @@ pub(crate) fn parse_bool(s: &str) -> Result<bool, anyhow::Error> {
 }
 
 pub(crate) fn parse_instance_spec(spec: &str, default_min_share_diff: Option<u32>) -> Result<InstanceConfig, anyhow::Error> {
-    let mut instance = InstanceConfig { stratum_port: String::new(), min_share_diff: 0, ..InstanceConfig::default() };
+    let mut instance =
+        InstanceConfig { stratum_port: String::new(), min_share_diff: MinShareDiff::fixed(0), ..InstanceConfig::default() };
 
     let mut has_port = false;
     let mut has_diff = false;
@@ -55,7 +56,8 @@ pub(crate) fn parse_instance_spec(spec: &str, default_min_share_diff: Option<u32
                 instance.prom_port = if normalized.is_empty() { None } else { Some(normalized) };
             }
             "diff" | "min_share_diff" => {
-                instance.min_share_diff = v.parse::<u32>().map_err(|e| anyhow::anyhow!("invalid min_share_diff '{v}': {e}"))?;
+                instance.min_share_diff =
+                    MinShareDiff::fixed(v.parse::<u32>().map_err(|e| anyhow::anyhow!("invalid min_share_diff '{v}': {e}"))?);
                 has_diff = true;
             }
             "wait" | "block_wait_time" => {
@@ -92,7 +94,7 @@ pub(crate) fn parse_instance_spec(spec: &str, default_min_share_diff: Option<u32
 
     if !has_diff {
         if let Some(d) = default_min_share_diff {
-            instance.min_share_diff = d;
+            instance.min_share_diff = MinShareDiff::fixed(d);
         } else {
             return Err(anyhow::anyhow!(
                 "instance is missing required 'diff' (min_share_diff) in '{spec}' and no global --min-share-diff was provided"
@@ -314,7 +316,7 @@ pub fn apply_cli_overrides(config: &mut BridgeConfig, cli: &Cli) -> Result<(), a
             instance.stratum_port = normalize_port(port);
         }
         if let Some(diff) = cli.min_share_diff {
-            instance.min_share_diff = diff;
+            instance.min_share_diff = MinShareDiff::fixed(diff);
         }
         if let Some(port) = cli.prom_port.as_deref() {
             instance.prom_port = Some(normalize_port(port));

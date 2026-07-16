@@ -4,12 +4,82 @@ use std::time::Duration;
 use crate::net_utils::normalize_port;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Starting difficulty seeded for variable-diff mode (`min_share_diff: variable`).
+pub const VARIABLE_DIFF_SEED: u32 = 16384;
+
+/// Per-instance minimum/starting share difficulty.
+///
+/// Deserialized from either a positive integer (a fixed seed — existing behaviour) or the literal
+/// string `variable`, which opts the instance into tuned variable-difficulty mode seeded at
+/// [`VARIABLE_DIFF_SEED`]. `variable` also implies `var_diff: on` (wired up in main.rs).
+#[derive(Debug, Clone, Copy)]
+pub struct MinShareDiff {
+    /// Starting/seed difficulty handed to a new miner.
+    pub seed: u32,
+    /// Whether tuned variable-difficulty mode is enabled for this instance.
+    pub variable: bool,
+}
+
+impl MinShareDiff {
+    pub const fn fixed(seed: u32) -> Self {
+        Self { seed, variable: false }
+    }
+
+    pub const fn variable() -> Self {
+        Self { seed: VARIABLE_DIFF_SEED, variable: true }
+    }
+}
+
+impl From<u32> for MinShareDiff {
+    fn from(seed: u32) -> Self {
+        Self::fixed(seed)
+    }
+}
+
+// Compare against a plain u32 seed so existing numeric checks/tests keep working; a `variable`
+// instance never compares equal to a bare number.
+impl PartialEq<u32> for MinShareDiff {
+    fn eq(&self, other: &u32) -> bool {
+        !self.variable && self.seed == *other
+    }
+}
+
+impl std::fmt::Display for MinShareDiff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.variable { write!(f, "variable (seed {})", self.seed) } else { write!(f, "{}", self.seed) }
+    }
+}
+
+impl Serialize for MinShareDiff {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.variable { serializer.serialize_str("variable") } else { serializer.serialize_u32(self.seed) }
+    }
+}
+
+impl<'de> Deserialize<'de> for MinShareDiff {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Num(u32),
+            Str(String),
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Num(seed) => Ok(MinShareDiff::fixed(seed)),
+            Raw::Str(ref s) if s.eq_ignore_ascii_case("variable") => Ok(MinShareDiff::variable()),
+            Raw::Str(s) => Err(<D::Error as serde::de::Error>::custom(format!(
+                "invalid min_share_diff '{s}': expected a positive integer or \"variable\""
+            ))),
+        }
+    }
+}
+
 /// Instance-specific configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InstanceConfig {
     #[serde(deserialize_with = "deserialize_port")]
     pub stratum_port: String,
-    pub min_share_diff: u32,
+    pub min_share_diff: MinShareDiff,
     #[serde(default, deserialize_with = "deserialize_optional_port")]
     pub prom_port: Option<String>, // Optional per-instance prom port
     pub log_to_file: Option<bool>, // Optional per-instance logging
@@ -179,7 +249,7 @@ struct BridgeConfigRaw {
     #[serde(default, deserialize_with = "deserialize_optional_port")]
     stratum_port: Option<String>,
     #[serde(default)]
-    min_share_diff: Option<u32>,
+    min_share_diff: Option<MinShareDiff>,
     #[serde(default, deserialize_with = "deserialize_optional_port")]
     prom_port: Option<String>,
 }
@@ -207,7 +277,7 @@ impl Default for InstanceConfig {
     fn default() -> Self {
         Self {
             stratum_port: ":5555".to_string(),
-            min_share_diff: 8192,
+            min_share_diff: MinShareDiff::fixed(8192),
             prom_port: None,
             log_to_file: None,
             block_wait_time: None,

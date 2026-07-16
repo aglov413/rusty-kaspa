@@ -17,7 +17,7 @@ pub mod stratum_context;
 pub mod stratum_listener;
 pub mod stratum_server;
 
-pub use app_config::{BridgeConfig, InstanceConfig};
+pub use app_config::{BridgeConfig, InstanceConfig, MinShareDiff};
 pub use client_handler::*;
 pub use default_client::*;
 pub use errors::*;

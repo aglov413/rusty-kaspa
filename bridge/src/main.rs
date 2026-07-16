@@ -421,8 +421,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 log_to_file: instance.log_to_file.unwrap_or(global.log_to_file),
                 health_check_port: String::new(),
                 block_wait_time: instance.block_wait_time.unwrap_or(global.block_wait_time),
-                min_share_diff: instance.min_share_diff,
-                var_diff: instance.var_diff.unwrap_or(global.var_diff),
+                min_share_diff: instance.min_share_diff.seed,
+                variable_diff: instance.min_share_diff.variable,
+                // Variable-diff mode requires the vardiff thread; force it on regardless of var_diff.
+                var_diff: instance.min_share_diff.variable || instance.var_diff.unwrap_or(global.var_diff),
                 shares_per_min: instance.shares_per_min.unwrap_or(global.shares_per_min),
                 var_diff_stats: instance.var_diff_stats.unwrap_or(global.var_diff_stats),
                 extranonce_size: instance.extranonce_size.unwrap_or(global.extranonce_size),

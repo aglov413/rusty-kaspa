@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 
-use crate::app_config::BridgeConfig;
+use crate::app_config::{BridgeConfig, MinShareDiff};
 use crate::net_utils::bind_addr_from_port;
 use std::path::PathBuf;
 
@@ -1594,8 +1594,12 @@ async fn update_config_from_json(json_body: &str) -> Result<(), Box<dyn std::err
     if let Some(port) = updates.get("stratum_port").and_then(|v| v.as_str()) {
         instance.stratum_port = crate::net_utils::normalize_port(port);
     }
-    if let Some(diff) = updates.get("min_share_diff").and_then(|v| v.as_u64()) {
-        instance.min_share_diff = diff as u32;
+    if let Some(v) = updates.get("min_share_diff") {
+        if let Some(diff) = v.as_u64() {
+            instance.min_share_diff = MinShareDiff::fixed(diff as u32);
+        } else if v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("variable")) {
+            instance.min_share_diff = MinShareDiff::variable();
+        }
     }
     if let Some(port) = updates.get("prom_port").and_then(|v| v.as_str()) {
         let normalized = crate::net_utils::normalize_port(port);

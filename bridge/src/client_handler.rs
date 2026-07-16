@@ -318,7 +318,10 @@ impl ClientHandler {
                 stratum_diff.set_diff_value_for_miner(effective_min_diff, &remote_app_clone);
                 state.set_stratum_diff(stratum_diff);
 
-                update_worker_difficulty(&WorkerContext::from_stratum(&instance_id, &client_clone, &remote_app_clone), effective_min_diff);
+                update_worker_difficulty(
+                    &WorkerContext::from_stratum(&instance_id, &client_clone, &remote_app_clone),
+                    effective_min_diff,
+                );
 
                 let target = state.stratum_diff().map(|d| d.target_value.clone()).unwrap_or_else(BigUint::zero);
                 let target_bytes = target.to_bytes_be();

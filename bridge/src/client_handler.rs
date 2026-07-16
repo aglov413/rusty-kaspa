@@ -297,26 +297,34 @@ impl ClientHandler {
                 job_id, client_clone.remote_addr, counter_after, stored_ids
             );
 
-            // Initialize state if first time
+            // On reconnect the WorkStats entry survives in the ShareHandler map (pruned after 600s),
+            // so restore the worker's last known diff instead of resetting to the instance minimum —
+            // a brief connection blip should not force the miner back to the starting difficulty.
+            // Genuinely new workers report <= 0.0 here and fall back to min_diff; for static diff (and
+            // any worker still at the seed) get_client_vardiff == min_diff, so this is a no-op there.
+            let existing_diff = share_handler.get_client_vardiff(&client_clone);
+            let effective_min_diff = if existing_diff > 0.0 { existing_diff } else { min_diff };
+
+            // Initialize state if first time (a new TCP connection always starts with a fresh MiningState)
             if !state.is_initialized() {
                 state.set_initialized(true);
                 let use_big_job = BIG_JOB_REGEX.is_match(&remote_app);
                 state.set_use_big_job(use_big_job);
 
-                // Initialize stratum diff
+                // Initialize stratum diff using effective_min_diff (preserves last known diff on reconnect)
                 use crate::hasher::KaspaDiff;
                 let mut stratum_diff = KaspaDiff::new();
                 let remote_app_clone = remote_app.clone();
-                stratum_diff.set_diff_value_for_miner(min_diff, &remote_app_clone);
+                stratum_diff.set_diff_value_for_miner(effective_min_diff, &remote_app_clone);
                 state.set_stratum_diff(stratum_diff);
 
-                update_worker_difficulty(&WorkerContext::from_stratum(&instance_id, &client_clone, &remote_app_clone), min_diff);
+                update_worker_difficulty(&WorkerContext::from_stratum(&instance_id, &client_clone, &remote_app_clone), effective_min_diff);
 
                 let target = state.stratum_diff().map(|d| d.target_value.clone()).unwrap_or_else(BigUint::zero);
                 let target_bytes = target.to_bytes_be();
                 debug!(
                     "send_immediate_job: Initialized MiningState with difficulty: {}, target: {:x} ({} bytes, {} bits)",
-                    min_diff,
+                    effective_min_diff,
                     target,
                     target_bytes.len(),
                     target_bytes.len() * 8
@@ -326,7 +334,7 @@ impl ClientHandler {
             // CRITICAL: Always send difficulty to each client (IceRiver expects this on every connection)
             // Even if state is already initialized, we need to send difficulty to this specific client
             // Use the actual current difficulty from state if available, otherwise use min_diff
-            let current_diff = state.stratum_diff().map(|d| d.diff_value).unwrap_or(min_diff);
+            let current_diff = state.stratum_diff().map(|d| d.diff_value).unwrap_or(effective_min_diff);
 
             // Update metric to ensure displayed difficulty matches what we're sending
             // (This handles the case where state was already initialized but metric wasn't updated)
@@ -335,7 +343,9 @@ impl ClientHandler {
             debug!("[DIFFICULTY] ===== SENDING DIFFICULTY TO {} =====", client_clone.remote_addr);
             debug!("[DIFFICULTY] Difficulty value: {} (from state: {})", current_diff, state.stratum_diff().is_some());
             send_client_diff(&instance_id, &client_clone, &state, current_diff);
-            share_handler.set_client_vardiff(&client_clone, min_diff);
+            // Reset the vardiff window at current_diff (not min_diff) so a reconnect keeps the
+            // restored difficulty instead of stamping the instance default back over it.
+            share_handler.set_client_vardiff(&client_clone, current_diff);
             debug!("[DIFFICULTY] ===== DIFFICULTY SENT TO {} =====", client_clone.remote_addr);
 
             // Small delay to ensure difficulty is sent before job

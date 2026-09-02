@@ -1,5 +1,6 @@
 //! TODO: module comment about locking safety and consistency of various pruning stores
 
+use crate::model::stores::shadow_lthash::ShadowLtHashStoreReader;
 use crate::{
     consensus::{
         services::{ConsensusServices, DbParentsManager, DbPruningPointManager},
@@ -30,6 +31,7 @@ use crate::{
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use itertools::Itertools;
+use kaspa_consensus_core::lthash::LtHashExtensions;
 use kaspa_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel,
     blockhash::ORIGIN,
@@ -40,9 +42,10 @@ use kaspa_consensus_core::{
     trusted::ExternalGhostdagData,
 };
 use kaspa_consensusmanager::SessionLock;
-use kaspa_core::{debug, info, trace, warn};
+use kaspa_core::{debug, error, info, trace, warn};
 use kaspa_database::prelude::{BatchDbWriter, DB, MemoryWriter, StoreResultExt};
 use kaspa_hashes::Hash;
+use kaspa_lthash::{LtHash, LtHashParams};
 use kaspa_muhash::MuHash;
 use kaspa_utils::iter::IterExtensions;
 use parking_lot::RwLockUpgradableReadGuard;
@@ -280,7 +283,85 @@ impl PruningProcessor {
             info!("Performing a sanity check that the new UTXO set has the expected UTXO commitment");
             self.assert_utxo_commitment(new_pruning_point);
         }
+
+        // Independent of `enable_sanity_checks`: producing this comparison is the entire
+        // reason the shadow exists, so enabling the shadow enables the check.
+        if self.shadow_lthash_store.is_some() {
+            self.check_shadow_lthash_drift(new_pruning_point);
+        }
         true
+    }
+
+    /// Compares the incrementally maintained LtHash shadow against a from-scratch rebuild
+    /// over the pruning point UTXO set.
+    ///
+    /// **This is the measurement the shadow is for.** The property tests and the 44.7M-UTXO
+    /// replay both validate the accumulator against *static* input. Only this check exercises
+    /// what a homomorphic accumulator is most likely to get wrong in production: the
+    /// incremental lifecycle across real reorgs -- where the accumulator is never rolled back
+    /// but re-read wholesale from its store (see `crypto/lthash/MUHASH-SURVEY.md` §4c) -- and across pruning.
+    ///
+    /// Unlike [`Self::assert_utxo_commitment`], a mismatch here does **not** panic. The shadow
+    /// is unaudited experimental code and must never be able to take a node down (invariant 3
+    /// in `crypto/lthash/INTEGRATION.md`); a drift is a research finding, not a consensus
+    /// fault. It is logged at error level with both digests so it cannot be missed.
+    ///
+    /// Cost: one full pass over the pruning point UTXO set, at roughly 8 us per UTXO.
+    fn check_shadow_lthash_drift(&self, pruning_point: Hash) {
+        let Some(store) = self.shadow_lthash_store.as_ref() else { return };
+
+        let stored = match store.get(pruning_point) {
+            Ok(state) => state,
+            Err(err) => {
+                // Expected when the shadow was switched on for a chain that was synced
+                // without it: there is simply nothing to compare against yet. Not a drift.
+                info!(
+                    "[SHADOW-LTHASH] no stored shadow for pruning point {} ({}); nothing to compare yet. \
+                     A shadow is established from a fresh sync or the next pruning point import.",
+                    pruning_point, err
+                );
+                return;
+            }
+        };
+
+        info!("[SHADOW-LTHASH] rebuilding the shadow from scratch over the pruning point UTXO set to check for drift");
+        let mut rebuilt = LtHash::new(LtHashParams::default());
+        let mut count = 0u64;
+        let pruning_meta_read = self.pruning_meta_stores.read();
+        for item in pruning_meta_read.utxo_set.iterator() {
+            // Deliberately not `unwrap()` -- see invariant 3. An unreadable entry abandons the
+            // check rather than panicking: we cannot conclude anything about drift from a
+            // partial rebuild, and reporting nothing is correct where reporting a false
+            // mismatch would not be.
+            let Ok((outpoint, entry)) = item else {
+                warn!("[SHADOW-LTHASH] unreadable UTXO entry during the drift rebuild; skipping this check");
+                return;
+            };
+            <LtHash as LtHashExtensions>::add_utxo(&mut rebuilt, &outpoint, &entry);
+            count += 1;
+        }
+        drop(pruning_meta_read);
+
+        if rebuilt == stored {
+            info!(
+                "[SHADOW-LTHASH] OK -- the incremental shadow matches a from-scratch rebuild over {} UTXOs \
+                 at pruning point {} (digest {})",
+                count,
+                pruning_point,
+                rebuilt.digest_hex()
+            );
+        } else {
+            error!(
+                "[SHADOW-LTHASH] DRIFT DETECTED at pruning point {} over {} UTXOs. \
+                 incremental={} rebuilt={}. The incrementally maintained LtHash no longer describes \
+                 the UTXO set, which means the accumulator lifecycle is wrong somewhere. \
+                 MuHash and consensus validation are unaffected.",
+                pruning_point,
+                count,
+                stored.digest_hex(),
+                rebuilt.digest_hex()
+            );
+        }
     }
 
     fn assert_utxo_commitment(&self, pruning_point: Hash) {
@@ -500,6 +581,14 @@ impl PruningProcessor {
 
                 // Prune data related to block bodies and UTXO state
                 self.utxo_multisets_store.delete_batch(&mut batch, current).unwrap();
+                // Same batch as the MuHash above, so the shadow can never outlive the state
+                // it shadows. `self` derefs to ConsensusStorage, so this is `None` unless the
+                // shadow is enabled.
+                if let Some(store) = self.shadow_lthash_store.as_ref()
+                    && let Err(err) = store.delete_batch(&mut batch, current)
+                {
+                    warn!("[SHADOW-LTHASH] could not stage shadow deletion for {}: {}", current, err);
+                }
                 self.utxo_diffs_store.delete_batch(&mut batch, current).unwrap();
                 self.acceptance_data_store.delete_batch(&mut batch, current).unwrap();
                 self.block_transactions_store.delete_batch(&mut batch, current).unwrap();

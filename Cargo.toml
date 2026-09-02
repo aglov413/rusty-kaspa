@@ -24,6 +24,7 @@ members = [
     "math",
     "crypto/hashes",
     "crypto/muhash",
+    "crypto/lthash",
     "crypto/addresses",
     "crypto/merkle",
     "notify",
@@ -88,6 +89,7 @@ default-members = [
     "math",
     "crypto/hashes",
     "crypto/muhash",
+    "crypto/lthash",
     "crypto/addresses",
     "crypto/merkle",
     "notify",
@@ -173,6 +175,7 @@ kaspa-metrics-core = { version = "1.1.0", path = "metrics/core" }
 kaspa-mining = { version = "1.1.0", path = "mining" }
 kaspa-mining-errors = { version = "1.1.0", path = "mining/errors" }
 kaspa-muhash = { version = "1.1.0", path = "crypto/muhash" }
+kaspa-lthash = { version = "0.1.0", path = "crypto/lthash" }
 kaspa-notify = { version = "1.1.0", path = "notify" }
 kaspa-p2p-flows = { version = "1.1.0", path = "protocol/flows" }
 kaspa-p2p-lib = { version = "1.1.0", path = "protocol/p2p" }
@@ -422,6 +425,12 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.kaspa-muhash]
+opt-level = 2
+
+# Same rationale as the crypto crates above: LtHash is unusably slow unoptimised, which would
+# make the shadow accumulator dominate any debug-profile run. (blake2b_simd and rand_chacha,
+# its only dependencies, already have entries below.)
+[profile.dev.package.kaspa-lthash]
 opt-level = 2
 
 [profile.dev.package.kaspa-pow]

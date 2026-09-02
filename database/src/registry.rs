@@ -83,6 +83,11 @@ pub enum DatabaseStorePrefixes {
     UtxoIndexTips = 193,
     CirculatingSupply = 194,
 
+    // ---- Shadow / experimental ----
+    // Deliberately placed above every prefix in use so that upstream additions, which take
+    // low numbers, cannot collide with it. Only opened when the LtHash shadow is enabled.
+    ShadowLtHash = 200,
+
     // ---- Separator ----
     /// Reserved as a separator
     Separator = SEPARATOR,

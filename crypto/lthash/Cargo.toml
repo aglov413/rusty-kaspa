@@ -1,0 +1,31 @@
+[package]
+name = "kaspa-lthash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "MIT OR Apache-2.0"
+description = "Shadow implementation of LtHash (lattice-based homomorphic multiset hash) for UTXO commitment experiments. UNAUDITED EXPERIMENT."
+readme = "README.md"
+publish = false
+
+[dependencies]
+# Same versions the incumbent MuHash crate resolves to (see Cargo.lock at the repo root),
+# so that the primitives underneath both accumulators are literally the same code.
+blake2b_simd = "1.0.2"
+# ChaCha20 for element expansion, keyed by a Blake2b-256 seed -- the same shape the
+# incumbent MuHash uses. Both are already in this repository's dependency graph at these
+# versions, so this crate introduces no new cryptographic code. See src/expand.rs.
+rand_chacha = "0.3.1"
+
+[dev-dependencies]
+# Same criterion version and feature set the root workspace uses (`criterion = { version =
+# "0.5.1", default-features = false }`), so the LtHash and MuHash benches are measured by
+# identical harness code.
+criterion = { version = "0.5.1", default-features = false }
+proptest = "1"
+rand = "0.8"
+rand_chacha = "0.3.1"
+
+[[bench]]
+name = "bench"
+harness = false

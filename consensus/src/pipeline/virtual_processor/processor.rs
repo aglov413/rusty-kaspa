@@ -29,6 +29,7 @@ use crate::{
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            shadow_lthash::{DbShadowLtHashStore, ShadowLtHashStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
@@ -49,6 +50,8 @@ use crate::{
         window::WindowManager,
     },
 };
+use kaspa_consensus_core::lthash::LtHashExtensions;
+use kaspa_consensus_core::shadowed_muhash::ShadowedMuHash;
 use kaspa_consensus_core::{
     BlockHashSet, ChainPath,
     acceptance_data::AcceptanceData,
@@ -78,6 +81,7 @@ use kaspa_consensusmanager::SessionLock;
 use kaspa_core::{debug, info, time::unix_now, trace, warn};
 use kaspa_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
 use kaspa_hashes::{Hash, ZERO_HASH};
+use kaspa_lthash::{LtHash, LtHashParams};
 use kaspa_muhash::MuHash;
 use kaspa_notify::{events::EventType, notifier::Notify};
 use once_cell::unsync::Lazy;
@@ -135,6 +139,8 @@ pub struct VirtualStateProcessor {
     // Utxo-related stores
     pub(super) utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub(super) utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
+    /// LtHash shadow. `Some` only when enabled; its presence is the flag (see `ConsensusStorage`).
+    pub(super) shadow_lthash_store: Option<Arc<DbShadowLtHashStore>>,
     pub(super) acceptance_data_store: Arc<DbAcceptanceDataStore>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
@@ -216,6 +222,7 @@ impl VirtualStateProcessor {
             pruning_samples_store: storage.pruning_samples_store.clone(),
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
+            shadow_lthash_store: storage.shadow_lthash_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
@@ -330,7 +337,7 @@ impl VirtualStateProcessor {
 
         assert_eq!(virtual_coloring_ghostdag_data.selected_parent, new_sink);
 
-        let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
+        let sink_multiset = self.load_shadowed_multiset(new_sink);
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
         let sink_ghostdag_data = Lazy::new(|| self.coloring_ghostdag_store.get_data(new_sink).unwrap());
         // Cache the DAA and Median time windows of the sink for future use, as well as prepare for virtual's window calculations
@@ -463,7 +470,7 @@ impl VirtualStateProcessor {
                     let mergeset_data = self.coloring_ghostdag_store.get_data(current).unwrap();
                     let pov_daa_score = header.daa_score;
 
-                    let selected_parent_multiset_hash = self.utxo_multisets_store.get(selected_parent).unwrap();
+                    let selected_parent_multiset_hash = self.load_shadowed_multiset(selected_parent);
                     let selected_parent_utxo_view = (&stores.utxo_set).compose(&*diff);
 
                     let mut ctx = UtxoProcessingContext::new(mergeset_data.into(), selected_parent_multiset_hash);
@@ -506,17 +513,76 @@ impl VirtualStateProcessor {
         diff_point
     }
 
+    /// Accumulates an LtHash over the current pruning-point UTXO set, or `None` when the
+    /// shadow is disabled.
+    ///
+    /// The shadow cannot be derived from the MuHash -- they are different algebras over the
+    /// same elements -- so it has to be built by iterating the set. That is one full pass
+    /// (measured at 112 s over a 45.6M-UTXO devnet set, ~2.45 us/UTXO) and only runs when
+    /// the shadow is enabled. This is also the path that repopulates a shadow for a chain
+    /// that was previously synced without one.
+    fn build_shadow_over_pruning_utxoset(&self) -> Option<LtHash> {
+        self.shadow_lthash_store.as_ref()?;
+        info!("[SHADOW-LTHASH] accumulating the shadow over the imported pruning point UTXO set (one full pass; this takes a while)");
+        let mut shadow = LtHash::new(LtHashParams::default());
+        let mut count = 0u64;
+        let pruning_meta_read = self.pruning_meta_stores.read();
+        for item in pruning_meta_read.utxo_set.iterator() {
+            // Deliberately not `unwrap()`. A shadow must never be able to take a node down
+            // (invariant 3 in crypto/lthash/INTEGRATION.md), so an unreadable UTXO entry
+            // abandons the shadow rather than panicking. The MuHash path would surface the
+            // same corruption on its own terms.
+            let Ok((outpoint, entry)) = item else {
+                warn!("[SHADOW-LTHASH] unreadable UTXO entry while building the shadow; abandoning it for this import");
+                return None;
+            };
+            <LtHash as LtHashExtensions>::add_utxo(&mut shadow, &outpoint, &entry);
+            count += 1;
+        }
+        drop(pruning_meta_read);
+        info!("[SHADOW-LTHASH] shadow accumulated over {} UTXOs", count);
+        Some(shadow)
+    }
+
+    /// Loads the stored MuHash for `hash` together with its LtHash shadow, when enabled.
+    ///
+    /// If the shadow is enabled but no state is stored for `hash` -- which happens when the
+    /// flag is turned on for a chain that was synced without it -- the shadow degrades to
+    /// `None` rather than starting from identity. Starting from identity would produce a
+    /// shadow that does not correspond to the UTXO set, and the drift check would then report
+    /// a mismatch that means nothing. Degrading is silent-by-design here: the *absence* of a
+    /// shadow is reported, never a wrong one. A later pruning-point import rebuilds it.
+    pub(super) fn load_shadowed_multiset(&self, hash: Hash) -> ShadowedMuHash {
+        let muhash = self.utxo_multisets_store.get(hash).unwrap();
+        let lthash = self.shadow_lthash_store.as_ref().and_then(|store| match store.get(hash) {
+            Ok(state) => Some(state),
+            Err(err) => {
+                debug!("[SHADOW-LTHASH] no usable shadow state for {}: {}. Continuing without a shadow.", hash, err);
+                None
+            }
+        });
+        ShadowedMuHash::from_parts(muhash, lthash)
+    }
+
     fn commit_utxo_state(
         &self,
         current: Hash,
         mergeset_diff: UtxoDiff,
-        multiset: MuHash,
+        multiset: ShadowedMuHash,
         acceptance_data: AcceptanceData,
         pruning_sample_from_pov: Hash,
     ) {
         let mut batch = WriteBatch::default();
+        let (muhash, lthash) = multiset.into_parts();
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
-        self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
+        self.utxo_multisets_store.insert_batch(&mut batch, current, muhash).unwrap();
+        // Staged into the SAME batch as the MuHash above: the two states are committed
+        // atomically, so a crash cannot leave them describing different UTXO sets.
+        if let (Some(store), Some(state)) = (self.shadow_lthash_store.as_ref(), lthash.as_ref())
+            && let Err(err) = store.set_batch(&mut batch, current, state)
+        {
+            warn!("[SHADOW-LTHASH] could not stage shadow state for {}: {}", current, err);
+        }
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
         // Note we call idempotent since this field can be populated during IBD with headers proof
         self.pruning_samples_store.insert_batch(&mut batch, current, pruning_sample_from_pov).idempotent().unwrap();
@@ -532,7 +598,7 @@ impl VirtualStateProcessor {
         virtual_parents: Vec<Hash>,
         virtual_topology_ghostdag_data: GhostdagData,
         virtual_coloring_ghostdag_data: GhostdagData,
-        selected_parent_multiset: MuHash,
+        selected_parent_multiset: ShadowedMuHash,
         accumulated_diff: &mut UtxoDiff,
         chain_path: &ChainPath,
     ) -> Result<Arc<VirtualState>, RuleError> {
@@ -554,7 +620,7 @@ impl VirtualStateProcessor {
         virtual_parents: Vec<Hash>,
         virtual_topology_ghostdag_data: GhostdagData,
         virtual_coloring_ghostdag_data: GhostdagData,
-        selected_parent_multiset: MuHash,
+        selected_parent_multiset: ShadowedMuHash,
         accumulated_diff: &mut UtxoDiff,
     ) -> Result<Arc<VirtualState>, RuleError> {
         let selected_parent_utxo_view = (&virtual_stores.utxo_set).compose(&*accumulated_diff);
@@ -580,7 +646,11 @@ impl VirtualStateProcessor {
             virtual_daa_window.daa_score,
             virtual_bits,
             virtual_past_median_time,
-            ctx.multiset_hash,
+            // `VirtualState` is serialized to the DB, so its `multiset` field stays a plain
+            // MuHash -- changing it would alter the on-disk format. Virtual's shadow is not
+            // persisted and is not needed: on restart virtual is recomputed from the sink,
+            // whose shadow *is* stored.
+            ctx.multiset_hash.into_parts().0,
             ctx.mergeset_diff,
             ctx.accepted_tx_ids,
             ctx.mergeset_rewards,
@@ -1258,7 +1328,13 @@ impl VirtualStateProcessor {
     /// Note that pruning point-related stores are initialized by `init`
     pub fn process_genesis(self: &Arc<Self>) {
         // Write the UTXO state of genesis
-        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH);
+        self.commit_utxo_state(
+            self.genesis.hash,
+            UtxoDiff::default(),
+            ShadowedMuHash::new(self.shadow_lthash_store.is_some()),
+            AcceptanceData::default(),
+            ZERO_HASH,
+        );
 
         // Init the virtual selected chain store
         let mut batch = WriteBatch::default();
@@ -1316,6 +1392,10 @@ impl VirtualStateProcessor {
             }
         }
 
+        // Built here, after the UTXO-set copy has released its locks and before virtual is
+        // read. Returns `None` unless the shadow is enabled.
+        let imported_shadow = self.build_shadow_over_pruning_utxoset();
+
         let virtual_read = self.virtual_stores.upgradable_read();
 
         // Validate transactions of the pruning point itself
@@ -1336,6 +1416,12 @@ impl VirtualStateProcessor {
             // Note we only have and need the multiset; acceptance data and utxo-diff are irrelevant.
             let mut batch = WriteBatch::default();
             self.utxo_multisets_store.set_batch(&mut batch, new_pruning_point, imported_utxo_multiset.clone()).unwrap();
+            // Same batch as the MuHash above.
+            if let (Some(store), Some(state)) = (self.shadow_lthash_store.as_ref(), imported_shadow.as_ref())
+                && let Err(err) = store.set_batch(&mut batch, new_pruning_point, state)
+            {
+                warn!("[SHADOW-LTHASH] could not stage the imported shadow state: {}", err);
+            }
 
             let statuses_write = self.statuses_store.set_batch(&mut batch, new_pruning_point, StatusUTXOValid).unwrap();
             self.db.write(batch).unwrap();
@@ -1358,7 +1444,7 @@ impl VirtualStateProcessor {
             virtual_parents,
             virtual_topology_ghostdag_data,
             virtual_coloring_ghostdag_data,
-            imported_utxo_multiset.clone(),
+            ShadowedMuHash::from_parts(imported_utxo_multiset.clone(), imported_shadow),
             &mut UtxoDiff::default(),
             &ChainPath::default(),
         )?;

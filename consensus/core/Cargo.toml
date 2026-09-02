@@ -28,6 +28,7 @@ js-sys.workspace = true
 kaspa-addresses.workspace = true
 kaspa-core.workspace = true
 kaspa-hashes.workspace = true
+kaspa-lthash.workspace = true
 kaspa-math.workspace = true
 kaspa-merkle.workspace = true
 kaspa-muhash.workspace = true

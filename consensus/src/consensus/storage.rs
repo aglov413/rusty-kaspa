@@ -18,6 +18,7 @@ use crate::{
         reachability::{DbReachabilityStore, ReachabilityData},
         relations::DbRelationsStore,
         selected_chain::DbSelectedChainStore,
+        shadow_lthash::DbShadowLtHashStore,
         statuses::DbStatusesStore,
         tips::DbTipsStore,
         utxo_diffs::DbUtxoDiffsStore,
@@ -70,6 +71,11 @@ pub struct ConsensusStorage {
     // Utxo-related stores
     pub utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
+    /// LtHash shadow accumulator. `Some` only when `--shadow-lthash` is set (devnet only).
+    ///
+    /// Presence of this store *is* the enable flag throughout the pipeline: no processor
+    /// carries a separate boolean, so the store and the behaviour cannot disagree.
+    pub shadow_lthash_store: Option<Arc<DbShadowLtHashStore>>,
     pub acceptance_data_store: Arc<DbAcceptanceDataStore>,
 
     // Block window caches
@@ -230,6 +236,10 @@ impl ConsensusStorage {
         let block_transactions_store = Arc::new(DbBlockTransactionsStore::new(db.clone(), transactions_builder.build()));
         let utxo_diffs_store = Arc::new(DbUtxoDiffsStore::new(db.clone(), utxo_diffs_builder.build()));
         let utxo_multisets_store = Arc::new(DbUtxoMultisetsStore::new(db.clone(), block_data_builder.build()));
+        // Only opened when explicitly enabled, so a node without the flag never touches the
+        // ShadowLtHash prefix at all.
+        let shadow_lthash_store =
+            config.shadow_lthash.then(|| Arc::new(DbShadowLtHashStore::new(db.clone(), block_data_builder.build())));
         let acceptance_data_store = Arc::new(DbAcceptanceDataStore::new(db.clone(), acceptance_data_builder.build()));
 
         // Tips
@@ -278,6 +288,7 @@ impl ConsensusStorage {
             pruning_samples_store,
             utxo_diffs_store,
             utxo_multisets_store,
+            shadow_lthash_store,
             block_window_cache_for_difficulty,
             block_window_cache_for_past_median_time,
             lkg_virtual_state,

@@ -1,8 +1,6 @@
 use std::{ops::Deref, sync::Arc};
 
-use crate::model::stores::{
-    pruning::PruningStoreReader, utxo_multisets::UtxoMultisetsStoreReader, virtual_state::VirtualStateStoreReader,
-};
+use crate::model::stores::{pruning::PruningStoreReader, virtual_state::VirtualStateStoreReader};
 use kaspa_consensus_core::{
     block::BlockTemplate, blockhash::ORIGIN, coinbase::MinerData, errors::block::RuleError, tx::Transaction,
     utxo::utxo_view::UtxoViewComposition,
@@ -50,7 +48,7 @@ impl TestBlockBuilder {
             self.sink_search_algorithm(&virtual_read, &mut accumulated_diff, sink, parents, finality_point, pruning_point);
         let (pov_virtual_parents, pov_virtual_topology_ghostdag_data, pov_virtual_coloring_ghostdag_data) =
             self.pick_virtual_parents(pov_sink, virtual_parent_candidates, pruning_point);
-        let pov_sink_multiset = self.utxo_multisets_store.get(pov_sink).unwrap();
+        let pov_sink_multiset = self.load_shadowed_multiset(pov_sink);
         let pov_virtual_state = self.calculate_virtual_state(
             &virtual_read,
             pov_virtual_parents,

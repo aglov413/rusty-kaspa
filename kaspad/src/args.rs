@@ -63,6 +63,8 @@ pub struct Args {
     pub rpc_max_clients: usize,
     pub max_tracked_addresses: usize,
     pub enable_unsynced_mining: bool,
+    /// Experimental LtHash shadow accumulator. Devnet only; never affects validation.
+    pub shadow_lthash: bool,
     pub enable_mainnet_mining: bool,
     pub testnet: bool,
     #[serde(rename = "netsuffix")]
@@ -118,6 +120,7 @@ impl Default for Args {
             rpc_max_clients: 128,
             max_tracked_addresses: 0,
             enable_unsynced_mining: false,
+            shadow_lthash: false,
             enable_mainnet_mining: true,
             testnet: false,
             testnet_suffix: 10,
@@ -166,6 +169,7 @@ impl Args {
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
         config.enable_unsynced_mining = self.enable_unsynced_mining;
+        config.shadow_lthash = self.shadow_lthash;
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
         // TODO: change to `config.enable_sanity_checks = self.sanity` when we reach stable versions
@@ -205,6 +209,24 @@ impl Args {
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
         }
+    }
+
+    /// Rejects argument combinations that are accepted by the parser but must not run.
+    ///
+    /// Currently only `--shadow-lthash`, which maintains an unaudited experimental accumulator
+    /// and is confined to devnet until the cryptographic review in
+    /// `crypto/lthash/PARAMETER-REVIEW.md` is answered. Failing closed here means a stray flag
+    /// on a mainnet or testnet node stops the node at startup rather than quietly enabling
+    /// experimental code on a real network.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shadow_lthash && self.network().network_type != NetworkType::Devnet {
+            return Err(format!(
+                "--shadow-lthash is experimental and devnet-only, but the selected network is {}. \
+                 Refusing to start. See crypto/lthash/INTEGRATION.md.",
+                self.network()
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -331,6 +353,7 @@ pub fn cli() -> Command {
         )
         .arg(arg!(--"reset-db" "Reset database before starting node. It's needed when switching between subnetworks.").env("KASPAD_RESET_DB"))
         .arg(arg!(--"enable-unsynced-mining" "Allow the node to accept blocks from RPC while not synced (this flag is mainly used for testing)").env("KASPAD_ENABLE_UNSYNCED_MINING"))
+        .arg(arg!(--"shadow-lthash" "EXPERIMENTAL, DEVNET ONLY. Maintain an LtHash shadow accumulator alongside MuHash for drift measurement. Never affects validation. Costs ~4x multiset CPU and +2KB per chain block."))
         .arg(
             Arg::new("enable-mainnet-mining")
                 .long("enable-mainnet-mining")
@@ -622,7 +645,13 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
 
 pub fn parse_args() -> Args {
     match Args::parse(std::env::args_os()) {
-        Ok(args) => args,
+        Ok(args) => {
+            if let Err(err) = args.validate() {
+                println!("{err}");
+                std::process::exit(1);
+            }
+            args
+        }
         Err(err) => {
             println!("{err}");
             std::process::exit(1);
@@ -670,6 +699,7 @@ impl Args {
             max_tracked_addresses: arg_match_unwrap_or::<usize>(&m, "max-tracked-addresses", defaults.max_tracked_addresses),
             reset_db: arg_match_unwrap_or::<bool>(&m, "reset-db", defaults.reset_db),
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
+            shadow_lthash: arg_match_unwrap_or::<bool>(&m, "shadow-lthash", defaults.shadow_lthash),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),

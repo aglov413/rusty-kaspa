@@ -21,6 +21,7 @@ use crate::{
         },
     },
 };
+use kaspa_consensus_core::shadowed_muhash::ShadowedMuHash;
 use kaspa_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -28,7 +29,6 @@ use kaspa_consensus_core::{
     coinbase::*,
     hashing,
     header::Header,
-    muhash::MuHashExtensions,
     tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
@@ -37,7 +37,6 @@ use kaspa_consensus_core::{
 };
 use kaspa_core::{info, trace};
 use kaspa_hashes::Hash;
-use kaspa_muhash::MuHash;
 use kaspa_utils::refs::Refs;
 
 use rayon::prelude::*;
@@ -78,7 +77,7 @@ pub(crate) mod crescendo {
 /// Note this can also be the virtual block.
 pub(super) struct UtxoProcessingContext<'a> {
     pub ghostdag_data: Refs<'a, GhostdagData>,
-    pub multiset_hash: MuHash,
+    pub multiset_hash: ShadowedMuHash,
     pub mergeset_diff: UtxoDiff,
     pub accepted_tx_ids: Vec<TransactionId>,
     pub mergeset_acceptance_data: Vec<MergesetBlockAcceptanceData>,
@@ -87,7 +86,7 @@ pub(super) struct UtxoProcessingContext<'a> {
 }
 
 impl<'a> UtxoProcessingContext<'a> {
-    pub fn new(ghostdag_data: Refs<'a, GhostdagData>, selected_parent_multiset_hash: MuHash) -> Self {
+    pub fn new(ghostdag_data: Refs<'a, GhostdagData>, selected_parent_multiset_hash: ShadowedMuHash) -> Self {
         let mergeset_size = ghostdag_data.mergeset_size();
         Self {
             ghostdag_data,
@@ -285,7 +284,9 @@ impl VirtualStateProcessor {
         utxo_view: &V,
         pov_daa_score: u64,
         flags: TxValidationFlags,
-    ) -> (SmallVec<[(ValidatedTransaction<'a>, u32); 2]>, MuHash) {
+    ) -> (SmallVec<[(ValidatedTransaction<'a>, u32); 2]>, ShadowedMuHash) {
+        // The store's presence is the enable flag; see `ConsensusStorage::shadow_lthash_store`.
+        let shadow = self.shadow_lthash_store.is_some();
         self.thread_pool.install(|| {
             txs
                 .par_iter() // We can do this in parallel without complications since block body validation already ensured
@@ -293,12 +294,13 @@ impl VirtualStateProcessor {
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| {
-                    let mh = MuHash::from_transaction(&vtx, pov_daa_score);
+                    let mut mh = ShadowedMuHash::new(shadow);
+                    mh.add_transaction(&vtx, pov_daa_score);
                     (smallvec![(vtx, i as u32)], mh)
                 }
                 ))
                 .reduce(
-                    || (smallvec![], MuHash::new()),
+                    || (smallvec![], ShadowedMuHash::new(shadow)),
                     |mut a, mut b| {
                         a.0.append(&mut b.0);
                         a.1.combine(&b.1);

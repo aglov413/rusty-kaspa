@@ -28,6 +28,7 @@ kaspa-database.workspace = true
 kaspa-hashes.workspace = true
 kaspa-math.workspace = true
 kaspa-merkle.workspace = true
+kaspa-lthash.workspace = true
 kaspa-muhash.workspace = true
 kaspa-notify.workspace = true
 kaspa-pow.workspace = true

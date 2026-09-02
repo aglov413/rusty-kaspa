@@ -38,6 +38,16 @@ pub struct Config {
     /// Enable various sanity checks which might be compute-intensive (mostly performed during pruning)
     pub enable_sanity_checks: bool,
 
+    /// Maintain an LtHash shadow accumulator alongside MuHash. **Experimental, devnet only.**
+    ///
+    /// The shadow is computed and persisted but never consulted for any validation decision:
+    /// `verify_expected_utxo_state` continues to compare MuHash, and only MuHash, against
+    /// `header.utxo_commitment`. Its purpose is drift detection across real reorgs and
+    /// pruning. See `crypto/lthash/INTEGRATION.md`.
+    ///
+    /// Costs roughly 4x the multiset CPU and +2048 bytes per retained chain block.
+    pub shadow_lthash: bool,
+
     // TODO: move non-consensus parameters like utxoindex to a higher scoped Config
     /// Enable the UTXO index
     pub utxoindex: bool,
@@ -85,6 +95,7 @@ impl Config {
             process_genesis: true,
             is_archival: false,
             enable_sanity_checks: false,
+            shadow_lthash: false,
             utxoindex: false,
             unsafe_rpc: false,
             enable_unsynced_mining: false,
@@ -168,6 +179,12 @@ impl ConfigBuilder {
 
     pub fn enable_sanity_checks(mut self) -> Self {
         self.config.enable_sanity_checks = true;
+        self
+    }
+
+    /// Enable the experimental LtHash shadow accumulator. Never affects validation.
+    pub fn enable_shadow_lthash(mut self) -> Self {
+        self.config.shadow_lthash = true;
         self
     }
 

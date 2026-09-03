@@ -1,3 +1,8 @@
+use crate::model::stores::{
+    shadow_lthash::{ShadowLtHashStore, ShadowLtHashStoreReader},
+    virtual_state::VirtualStateStoreReader,
+};
+use crate::pipeline::virtual_processor::processor::ShadowBackfillOutcome;
 use crate::{consensus::test_consensus::TestConsensus, model::services::reachability::ReachabilityService};
 use kaspa_consensus_core::{
     BlockHashSet,
@@ -10,6 +15,7 @@ use kaspa_consensus_core::{
     tx::{ScriptPublicKey, ScriptVec, Transaction},
 };
 use kaspa_hashes::Hash;
+use kaspa_lthash::{LtHash, LtHashParams};
 use std::{collections::VecDeque, thread::JoinHandle};
 
 struct OnetimeTxSelector {
@@ -294,6 +300,143 @@ async fn double_search_disqualified_test() {
         ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
     }
     ctx.assert_tips_num(1);
+}
+
+/// The backfill has to reproduce, byte for byte, the shadow the pipeline built incrementally.
+///
+/// This is the one thing that must be true of it: a backfill that is subtly wrong produces a
+/// shadow that looks fine and drifts silently, which is exactly the failure mode the shadow
+/// exists to detect. So the test mines a chain with the shadow enabled, keeps the incrementally
+/// accumulated value, wipes every stored entry, and asserts the backfill rebuilds the same value
+/// at the sink -- and at the intermediate chain blocks, which the drift check and the reorg path
+/// both depend on.
+#[tokio::test]
+async fn shadow_lthash_backfill_reproduces_the_incremental_shadow() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_shadow_lthash().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // Enough rows to give the chain real UTXO diffs to replay: every chain block spends nothing
+    // but adds a coinbase output, and merged blocks contribute rewards of their own.
+    for _ in 0..10 {
+        ctx.build_block_template_row(0..3).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let store = vp.shadow_lthash_store.as_ref().expect("the shadow is enabled for this config").clone();
+    let genesis = ctx.consensus.params().genesis.hash;
+    let sink = ctx.consensus.virtual_stores().read().state.get().unwrap().coloring_ghostdag_data.selected_parent;
+    assert_ne!(sink, genesis, "the chain must have advanced for this test to mean anything");
+
+    // The values the running pipeline produced, which the backfill has to match.
+    let chain: Vec<Hash> = vp.reachability_service.forward_chain_iterator(genesis, sink, true).collect();
+    let expected: Vec<_> = chain.iter().map(|&h| store.get(h).expect("a shadow per chain block").digest()).collect();
+
+    // Wipe the shadow, leaving exactly the state of a chain synced without the flag.
+    for &h in chain.iter() {
+        store.delete(h).unwrap();
+    }
+    assert!(store.get(sink).is_err(), "the shadow must actually be gone for the backfill to be exercised");
+
+    vp.backfill_shadow_if_needed();
+
+    let rebuilt: Vec<_> = chain.iter().map(|&h| store.get(h).expect("the backfill writes every chain block").digest()).collect();
+    assert_eq!(expected, rebuilt, "the backfilled shadow diverges from the incrementally accumulated one");
+}
+
+/// The backfill must leave a chain that already carries a shadow completely untouched, and must
+/// do nothing at all when the flag is off. Both are the invariant-3 cases: it can only ever add a
+/// shadow where there was none.
+#[tokio::test]
+async fn shadow_lthash_backfill_is_a_noop_when_not_needed() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_shadow_lthash().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..3).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let store = vp.shadow_lthash_store.as_ref().unwrap().clone();
+    let sink = ctx.consensus.virtual_stores().read().state.get().unwrap().coloring_ghostdag_data.selected_parent;
+    let before = store.get(sink).unwrap().digest();
+
+    vp.backfill_shadow_if_needed();
+    assert_eq!(before, store.get(sink).unwrap().digest());
+
+    // And with the shadow disabled the store does not exist, so there is nothing to backfill.
+    let plain_config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let plain_ctx = TestContext::new(TestConsensus::new(&plain_config));
+    let plain_vp = plain_ctx.consensus.virtual_processor().clone();
+    assert!(plain_vp.shadow_lthash_store.is_none());
+    plain_vp.backfill_shadow_if_needed();
+}
+
+/// The shape of the devnet procedure: a node runs with the shadow, then runs *without* it for a
+/// while, then turns it back on. The earlier entries survive the gap -- pruning only deletes them
+/// while the store exists -- so the replay lands on a stretch of states the pipeline accumulated
+/// incrementally, and has to reproduce every one of them.
+#[tokio::test]
+async fn shadow_lthash_backfill_cross_checks_against_surviving_states() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_shadow_lthash().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for _ in 0..10 {
+        ctx.build_block_template_row(0..3).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let store = vp.shadow_lthash_store.as_ref().unwrap().clone();
+    let genesis = ctx.consensus.params().genesis.hash;
+    let sink = ctx.consensus.virtual_stores().read().state.get().unwrap().coloring_ghostdag_data.selected_parent;
+    let chain: Vec<Hash> = vp.reachability_service.forward_chain_iterator(genesis, sink, true).collect();
+    assert!(chain.len() > 4, "need a chain long enough to leave a surviving prefix");
+
+    // Drop only the tail, as a shadow-less run would: the sink loses its state (which is what
+    // triggers a backfill) while the earlier states remain as evidence.
+    let dropped = 3;
+    let expected_sink = store.get(sink).unwrap();
+    for &h in chain.iter().rev().take(dropped) {
+        store.delete(h).unwrap();
+    }
+
+    let outcome = vp.backfill_shadow_if_needed();
+
+    // Every surviving state must have been reproduced exactly, or the backfill would have
+    // abandoned instead of anchoring.
+    let surviving = (chain.len() - dropped) as u64;
+    assert_eq!(outcome, ShadowBackfillOutcome::Anchored { replayed: chain.len() as u64 - 1, agreed: surviving });
+    assert_eq!(store.get(sink).unwrap(), expected_sink, "the re-derived sink state must match what was dropped");
+}
+
+/// A replayed state that disagrees with one the pipeline accumulated earlier must stop the
+/// backfill dead: no shadow anchored at the sink, and the earlier states left untouched so the
+/// disagreement can still be diagnosed. Writing on through a mismatch would replace a shadow that
+/// may be the correct one with a chain of values that may not be.
+#[tokio::test]
+async fn shadow_lthash_backfill_abandons_on_a_mismatch() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().enable_shadow_lthash().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for _ in 0..10 {
+        ctx.build_block_template_row(0..3).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let store = vp.shadow_lthash_store.as_ref().unwrap().clone();
+    let genesis = ctx.consensus.params().genesis.hash;
+    let sink = ctx.consensus.virtual_stores().read().state.get().unwrap().coloring_ghostdag_data.selected_parent;
+    let chain: Vec<Hash> = vp.reachability_service.forward_chain_iterator(genesis, sink, true).collect();
+    assert!(chain.len() > 3);
+
+    // Corrupt a state partway along, and drop the sink's so a backfill is triggered at all.
+    let corrupt_at = chain[chain.len() / 2];
+    let mut wrong = LtHash::new(LtHashParams::default());
+    wrong.add_element(b"a state that no UTXO set produces");
+    store.insert(corrupt_at, &wrong).unwrap();
+    store.delete(sink).unwrap();
+
+    let outcome = vp.backfill_shadow_if_needed();
+
+    assert!(matches!(outcome, ShadowBackfillOutcome::Abandoned { .. }), "a mismatch must abandon, got {outcome:?}");
+    assert!(store.get(sink).is_err(), "no shadow may be anchored at the sink after a mismatch");
+    assert_eq!(store.get(corrupt_at).unwrap(), wrong, "the disagreeing state must be left in place for diagnosis");
 }
 
 fn new_miner_data() -> MinerData {

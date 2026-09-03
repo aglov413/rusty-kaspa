@@ -78,7 +78,7 @@ use kaspa_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use kaspa_consensusmanager::SessionLock;
-use kaspa_core::{debug, info, time::unix_now, trace, warn};
+use kaspa_core::{debug, error, info, time::unix_now, trace, warn};
 use kaspa_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
 use kaspa_hashes::{Hash, ZERO_HASH};
 use kaspa_lthash::{LtHash, LtHashParams};
@@ -104,6 +104,25 @@ use std::{
     ops::Deref,
     sync::{Arc, atomic::Ordering},
 };
+
+/// What [`VirtualStateProcessor::backfill_shadow_if_needed`] did.
+///
+/// Shadow-only, like everything else here: no variant is an error the node acts on, and the
+/// production caller discards it. It exists so the outcome can be asserted rather than only
+/// read out of a log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowBackfillOutcome {
+    /// Nothing to do: the shadow is disabled, there is no chain yet, a shadow is already anchored
+    /// at the sink, or the pruning UTXO set is not usable as a seed right now.
+    Skipped,
+    /// A shadow was rebuilt and anchored at the sink. `agreed` counts the chain blocks whose
+    /// previously accumulated state the replay reproduced exactly.
+    Anchored { replayed: u64, agreed: u64 },
+    /// Started but did not finish, so no shadow is anchored at the sink and the node runs without
+    /// one. Either a read failed, or -- the interesting case -- a replayed state disagreed with
+    /// one the pipeline had accumulated earlier.
+    Abandoned { agreed: u64 },
+}
 
 pub struct VirtualStateProcessor {
     // Channels
@@ -513,17 +532,23 @@ impl VirtualStateProcessor {
         diff_point
     }
 
-    /// Accumulates an LtHash over the current pruning-point UTXO set, or `None` when the
+    /// Accumulates an LtHash over the pruning UTXO set currently on disk, or `None` when the
     /// shadow is disabled.
     ///
     /// The shadow cannot be derived from the MuHash -- they are different algebras over the
     /// same elements -- so it has to be built by iterating the set. That is one full pass
     /// (measured at 112 s over a 45.6M-UTXO devnet set, ~2.45 us/UTXO) and only runs when
-    /// the shadow is enabled. This is also the path that repopulates a shadow for a chain
-    /// that was previously synced without one.
+    /// the shadow is enabled.
+    ///
+    /// Two callers, and the difference between them matters. [`Self::import_pruning_point_utxo_set`]
+    /// calls it when the set has just been imported and virtual is being reset onto the pruning
+    /// point, so the value it returns *is* the sink's. [`Self::backfill_shadow_if_needed`] calls
+    /// it at startup on a set that sits far below the sink, and must carry the value forward
+    /// itself. This function only produces the value at whatever chain block the set is
+    /// positioned at; anchoring it is the caller's job.
     fn build_shadow_over_pruning_utxoset(&self) -> Option<LtHash> {
         self.shadow_lthash_store.as_ref()?;
-        info!("[SHADOW-LTHASH] accumulating the shadow over the imported pruning point UTXO set (one full pass; this takes a while)");
+        info!("[SHADOW-LTHASH] accumulating the shadow over the pruning point UTXO set (one full pass; this takes a while)");
         let mut shadow = LtHash::new(LtHashParams::default());
         let mut count = 0u64;
         let pruning_meta_read = self.pruning_meta_stores.read();
@@ -544,6 +569,248 @@ impl VirtualStateProcessor {
         Some(shadow)
     }
 
+    /// Backfills the shadow for a chain that was synced without it, so that `--shadow-lthash`
+    /// can be enabled on an existing datadir instead of requiring a resync.
+    ///
+    /// # Why no new UTXO-set logic is needed
+    ///
+    /// Every node maintains a full UTXO set at a known chain block whether or not the shadow is
+    /// enabled: `pruning_meta.utxo_set`, positioned at `utxoset_position` and advanced one chain
+    /// block at a time by `PruningProcessor::advance_pruning_utxoset`. So the shadow can be
+    /// seeded there with the same full pass the import path already uses, then carried forward to
+    /// the sink by replaying the stored chain-block UTXO diffs -- the identical walk the pruning
+    /// processor performs, minus the UTXO-set writes.
+    ///
+    /// Landing on the *sink* is the whole point. The sink is what `resolve_virtual` reads through
+    /// `load_shadowed_multiset` to keep accumulating, and it sits roughly a pruning depth
+    /// above `utxoset_position`. A shadow anchored anywhere else is never read.
+    ///
+    /// # Why an entry is written for every chain block on the way, not just the sink
+    ///
+    /// Both reasons are about the *checks*, not the accumulation:
+    ///
+    /// 1. The next pruning point lands *between* `utxoset_position` and the sink, so a sink-only
+    ///    backfill would leave `PruningProcessor::check_shadow_lthash_drift` with nothing to
+    ///    compare for roughly a full pruning depth -- about 30 h at 10 BPS. Writing the
+    ///    intermediate entries means the very next pruning point movement verifies the backfill
+    ///    against a from-scratch rebuild, which is the only thing that should make anyone believe
+    ///    a backfilled shadow.
+    /// 2. A reorg does not roll the accumulator back; it re-reads the stored value wholesale at
+    ///    the new selected parent (see `shadow_lthash.rs`). The intermediate entries are what lets
+    ///    a reorg into the backfilled range keep its shadow instead of degrading to `None`.
+    ///
+    /// These are the same entries a fresh sync would have written, under the same keys, deleted in
+    /// the same pruning batch as their MuHash -- so the end state is indistinguishable from a node
+    /// that had the shadow on from the start. The storage is not additional either: it is the
+    /// ~2 KB per retained chain block the store reaches at steady state regardless, just paid up
+    /// front.
+    ///
+    /// # The cross-check, and why it is worth the extra read
+    ///
+    /// Enabling the flag on a datadir that carried a shadow *before* -- run without the flag for a
+    /// while, then with it again -- leaves the earlier entries in place, because pruning only
+    /// deletes them when the store exists. The replay range then overlaps a stretch of shadow
+    /// states the pipeline accumulated incrementally, across real pruning transitions.
+    ///
+    /// That overlap is the strongest evidence available that the backfill is correct, and
+    /// overwriting it blind would destroy it. So every block whose entry already exists is
+    /// compared before being rewritten, and a disagreement **abandons the backfill without
+    /// writing further**. Two reasons to abandon rather than continue: a mismatch means one of the
+    /// two values is wrong and nothing here can say which, so writing the backfilled chain forward
+    /// risks replacing a good shadow with a bad one; and stopping leaves the earlier states intact
+    /// for diagnosis. The node then runs with no shadow, which is the correct degradation.
+    ///
+    /// # Failure policy
+    ///
+    /// Every failure path returns without a shadow rather than panicking (invariant 3 in
+    /// `crypto/lthash/INTEGRATION.md`). A node that fails to backfill runs exactly as it did
+    /// before and reports no shadow -- never a wrong one. Abandoning part-way through is safe
+    /// too: the entries already written are correct values for their chain blocks, just an
+    /// incomplete prefix, and since this function keys off the *sink* entry a partial run simply
+    /// backfills again from the start on the next boot.
+    ///
+    /// Runs once at startup, before any processor consumes a block, so the sink cannot move
+    /// underneath the walk and leave un-shadowed chain blocks behind it.
+    ///
+    /// Returns what happened. The production caller ignores it -- the logs are the interface
+    /// there -- but returning it rather than only logging keeps the outcome assertable in tests.
+    pub fn backfill_shadow_if_needed(self: &Arc<Self>) -> ShadowBackfillOutcome {
+        /// Chain blocks staged per write batch. At ~2 KB per entry this caps a batch at ~2 MB.
+        const BACKFILL_BATCH_BLOCKS: usize = 1000;
+        /// Chain blocks between progress lines. The walk is long enough that a silent startup
+        /// would look like a hang.
+        const BACKFILL_PROGRESS_INTERVAL: u64 = 100_000;
+
+        let Some(store) = self.shadow_lthash_store.as_ref() else { return ShadowBackfillOutcome::Skipped };
+
+        // Absent on a brand-new database -- notably a staging consensus, which is built with
+        // `skip_adding_genesis` against an empty directory and has no chain to backfill.
+        let Ok(virtual_state) = self.virtual_stores.read().state.get() else {
+            debug!("[SHADOW-LTHASH] no virtual state stored yet; nothing to backfill");
+            return ShadowBackfillOutcome::Skipped;
+        };
+        let sink = virtual_state.coloring_ghostdag_data.selected_parent;
+
+        if store.get(sink).is_ok() {
+            // The common case: the chain already carries a shadow at the point the pipeline
+            // will read it from.
+            return ShadowBackfillOutcome::Skipped;
+        }
+
+        let (position, transitional) = {
+            let pruning_meta_read = self.pruning_meta_stores.read();
+            (pruning_meta_read.utxoset_position(), pruning_meta_read.is_in_transitional_ibd_state())
+        };
+
+        if transitional {
+            // Mid-IBD the pruning UTXO set is not a coherent snapshot of any chain block. The
+            // shadow is seeded by `import_pruning_point_utxo_set` on that path anyway.
+            info!("[SHADOW-LTHASH] skipping the backfill: consensus is in a transitional IBD state");
+            return ShadowBackfillOutcome::Skipped;
+        }
+
+        let Ok(position) = position else {
+            info!("[SHADOW-LTHASH] skipping the backfill: the pruning UTXO set has no recorded position");
+            return ShadowBackfillOutcome::Skipped;
+        };
+
+        // `try_` rather than the unwrapping variant: a reachability error here would panic in a
+        // path that exists only to add a shadow, which invariant 3 forbids.
+        if position != sink && !matches!(self.reachability_service.try_is_chain_ancestor_of(position, sink), Ok(true)) {
+            info!(
+                "[SHADOW-LTHASH] skipping the backfill: the pruning UTXO set position {} is not a known chain ancestor of the sink {}",
+                position, sink
+            );
+            return ShadowBackfillOutcome::Skipped;
+        }
+
+        info!("[SHADOW-LTHASH] no shadow stored for the sink {}; backfilling from the pruning UTXO set at {}", sink, position);
+
+        let Some(mut shadow) = self.build_shadow_over_pruning_utxoset() else {
+            warn!("[SHADOW-LTHASH] could not accumulate over the pruning UTXO set; abandoning the backfill");
+            return ShadowBackfillOutcome::Abandoned { agreed: 0 };
+        };
+
+        let mut batch = WriteBatch::default();
+        let mut staged = 0usize;
+        let mut replayed = 0u64;
+        // Chain blocks whose already-stored state matched what the replay recomputed. See the
+        // cross-check section above -- this is the number worth reading in the completion line.
+        let mut agreed = 0u64;
+
+        // The seed itself is a chain block with a stored MuHash, so it gets an entry like any
+        // other. When `position == sink` the loop below is empty and this is the whole backfill.
+        if !self.cross_check_shadow(store, position, &shadow, &mut agreed) {
+            return ShadowBackfillOutcome::Abandoned { agreed };
+        }
+        if let Err(err) = store.set_batch(&mut batch, position, &shadow) {
+            warn!("[SHADOW-LTHASH] could not stage the shadow for {}: {}; abandoning the backfill", position, err);
+            return ShadowBackfillOutcome::Abandoned { agreed };
+        }
+        staged += 1;
+
+        for chain_block in self.reachability_service.forward_chain_iterator(position, sink, true).skip(1) {
+            let mergeset_diff = match self.utxo_diffs_store.get(chain_block) {
+                Ok(diff) => diff,
+                Err(err) => {
+                    // Deliberately not `expect`, unlike `advance_pruning_utxoset`'s identical
+                    // read. There the diff is load-bearing for the UTXO set; here a gap only
+                    // costs a shadow, and abandoning beats taking the node down for one.
+                    warn!(
+                        "[SHADOW-LTHASH] no UTXO diff for chain block {} ({}); abandoning the backfill. \
+                         The node continues without a shadow.",
+                        chain_block, err
+                    );
+                    return ShadowBackfillOutcome::Abandoned { agreed };
+                }
+            };
+
+            // Removals before additions is only a convention here -- the accumulator is an
+            // abelian group, so the order within a diff cannot matter. It mirrors
+            // `DbUtxoSetStore::write_diff_batch`, where the order does.
+            for (outpoint, entry) in mergeset_diff.remove.iter() {
+                <LtHash as LtHashExtensions>::remove_utxo(&mut shadow, outpoint, entry);
+            }
+            for (outpoint, entry) in mergeset_diff.add.iter() {
+                <LtHash as LtHashExtensions>::add_utxo(&mut shadow, outpoint, entry);
+            }
+
+            if !self.cross_check_shadow(store, chain_block, &shadow, &mut agreed) {
+                return ShadowBackfillOutcome::Abandoned { agreed };
+            }
+
+            if let Err(err) = store.set_batch(&mut batch, chain_block, &shadow) {
+                warn!("[SHADOW-LTHASH] could not stage the shadow for {}: {}; abandoning the backfill", chain_block, err);
+                return ShadowBackfillOutcome::Abandoned { agreed };
+            }
+            staged += 1;
+            replayed += 1;
+
+            if staged >= BACKFILL_BATCH_BLOCKS {
+                if let Err(err) = self.db.write(batch) {
+                    warn!("[SHADOW-LTHASH] could not write backfilled shadow states: {}; abandoning the backfill", err);
+                    return ShadowBackfillOutcome::Abandoned { agreed };
+                }
+                batch = WriteBatch::default();
+                staged = 0;
+            }
+
+            if replayed.is_multiple_of(BACKFILL_PROGRESS_INTERVAL) {
+                info!("[SHADOW-LTHASH] backfill progress: {} chain blocks replayed", replayed);
+            }
+        }
+
+        if let Err(err) = self.db.write(batch) {
+            warn!("[SHADOW-LTHASH] could not write backfilled shadow states: {}; abandoning the backfill", err);
+            return ShadowBackfillOutcome::Abandoned { agreed };
+        }
+
+        info!(
+            "[SHADOW-LTHASH] backfill complete: {} chain blocks replayed, shadow anchored at the sink {} with digest {}",
+            replayed,
+            sink,
+            shadow.digest_hex()
+        );
+        if agreed > 0 {
+            info!(
+                "[SHADOW-LTHASH] the replay agreed with {} previously accumulated shadow states along the way; \
+                 the backfill reproduces what the pipeline built incrementally",
+                agreed
+            );
+        } else {
+            info!("[SHADOW-LTHASH] no previously accumulated shadow states were available to cross-check against");
+        }
+        info!("[SHADOW-LTHASH] the next pruning point movement will check this backfill against a from-scratch rebuild");
+        ShadowBackfillOutcome::Anchored { replayed, agreed }
+    }
+
+    /// Compares a replayed shadow against any state already stored for `chain_block`.
+    ///
+    /// Returns `false` when a stored state disagrees, which abandons the backfill -- see the
+    /// cross-check section of [`Self::backfill_shadow_if_needed`]. A block with no stored state,
+    /// or one whose state cannot be read (a parameter change makes every entry unreadable), is
+    /// simply not evidence either way, and is neither counted nor treated as a mismatch.
+    fn cross_check_shadow(&self, store: &DbShadowLtHashStore, chain_block: Hash, replayed: &LtHash, agreed: &mut u64) -> bool {
+        let Ok(stored) = store.get(chain_block) else { return true };
+        if &stored == replayed {
+            *agreed += 1;
+            return true;
+        }
+        // Loud, and the only error-level line in the backfill. This is a research finding about
+        // the accumulator, which is exactly what the shadow exists to produce -- it is not a
+        // consensus fault and must not be treated as one.
+        error!(
+            "[SHADOW-LTHASH] BACKFILL MISMATCH at chain block {}: the replay computed {} but the state accumulated \
+             earlier by the pipeline is {}. Abandoning the backfill and leaving the earlier states untouched for \
+             diagnosis; the node continues without a shadow. {} chain blocks agreed before this one.",
+            chain_block,
+            replayed.digest_hex(),
+            stored.digest_hex(),
+            agreed
+        );
+        false
+    }
+
     /// Loads the stored MuHash for `hash` together with its LtHash shadow, when enabled.
     ///
     /// If the shadow is enabled but no state is stored for `hash` -- which happens when the
@@ -551,7 +818,8 @@ impl VirtualStateProcessor {
     /// `None` rather than starting from identity. Starting from identity would produce a
     /// shadow that does not correspond to the UTXO set, and the drift check would then report
     /// a mismatch that means nothing. Degrading is silent-by-design here: the *absence* of a
-    /// shadow is reported, never a wrong one. A later pruning-point import rebuilds it.
+    /// shadow is reported, never a wrong one. [`Self::backfill_shadow_if_needed`] establishes
+    /// one at startup, and a pruning-point import re-establishes one mid-run.
     pub(super) fn load_shadowed_multiset(&self, hash: Hash) -> ShadowedMuHash {
         let muhash = self.utxo_multisets_store.get(hash).unwrap();
         let lthash = self.shadow_lthash_store.as_ref().and_then(|store| match store.get(hash) {

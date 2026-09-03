@@ -267,8 +267,31 @@ which can be read directly.
 * **A missing shadow degrades to `None`, never to identity.** Seeding from identity would
   produce a shadow that does not describe the UTXO set, and the drift check would then report
   a mismatch that means nothing. Reporting the *absence* of a shadow is recoverable; reporting
-  a wrong one is not. Consequence: **enabling the flag on an existing database does not
-  backfill** — a shadow requires a fresh sync or a pruning-point import.
+  a wrong one is not.
+
+* **Enabling the flag on an existing database backfills at startup.**
+  `VirtualStateProcessor::backfill_shadow_if_needed`, called from `Consensus::new` before any
+  processor runs, seeds an accumulator over the pruning UTXO set already on disk and replays
+  the stored chain-block UTXO diffs forward to the sink — the same walk
+  `PruningProcessor::advance_pruning_utxoset` performs, without the UTXO-set writes. It writes
+  an entry per chain block on the way, not just the sink, for two reasons: the next pruning
+  point lands *inside* the replayed range, so the existing drift check verifies the backfill on
+  the very next pruning point movement rather than a pruning depth later; and a reorg into the
+  range re-reads the shadow wholesale from the store, so the intermediate entries are what keep
+  it alive. The result is keyed and pruned identically to what a fresh sync would have written.
+  Startup blocks for the duration — one full UTXO-set pass plus the replay. Every failure path
+  abandons the backfill and leaves the node reporting no shadow, per invariant 3.
+
+* **The backfill cross-checks itself against any shadow that survived.** Turning the flag *off*
+  for a while and back on leaves the earlier entries in place, because pruning only deletes them
+  while the store exists. The replay then overlaps a stretch of states the pipeline accumulated
+  incrementally, across real pruning transitions — the strongest available evidence that a
+  backfill is correct, and overwriting it blind would destroy it. So every block whose entry
+  already exists is compared before being rewritten. Agreement is counted and reported in the
+  completion log; a disagreement is logged at error level with both digests and **abandons the
+  backfill without writing further**, since nothing here can say which of the two values is wrong
+  and continuing risks replacing a good shadow with a bad one. The earlier states are left intact
+  for diagnosis and the node runs with no shadow, which is the correct degradation.
 
 * **`ShadowedMuHash::combine` does not assert agreement.** An earlier version asserted that
   both sides always had the same shadow state. That is false: the mismatch is exactly what

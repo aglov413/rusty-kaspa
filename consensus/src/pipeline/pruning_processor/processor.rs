@@ -317,7 +317,7 @@ impl PruningProcessor {
                 // without it: there is simply nothing to compare against yet. Not a drift.
                 info!(
                     "[SHADOW-LTHASH] no stored shadow for pruning point {} ({}); nothing to compare yet. \
-                     A shadow is established from a fresh sync or the next pruning point import.",
+                     A shadow is established by a fresh sync, the startup backfill, or a pruning point import.",
                     pruning_point, err
                 );
                 return;

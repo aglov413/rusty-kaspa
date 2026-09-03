@@ -297,6 +297,19 @@ impl Consensus {
             virtual_processor.process_genesis();
         }
 
+        // Backfill the LtHash shadow if this datadir was synced without one. No-op unless
+        // `--shadow-lthash` is set, and no-op when a shadow is already anchored at the sink.
+        //
+        // Deliberately here rather than inside a processor: nothing consumes blocks until
+        // `run_processors`, so the sink is a fixed snapshot for the duration of the walk. Doing
+        // it concurrently would let the sink advance past the backfilled range and leave chain
+        // blocks with no shadow entry behind it.
+        //
+        // Cost when it does run is a full pass over the pruning UTXO set plus a chain-diff
+        // replay to the sink, which blocks startup for minutes. That is the price of not
+        // resyncing, and it is paid only on the run that enables the flag.
+        virtual_processor.backfill_shadow_if_needed();
+
         let this = Self {
             db,
             block_sender: sender,

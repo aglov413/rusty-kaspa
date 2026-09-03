@@ -353,7 +353,7 @@ pub fn cli() -> Command {
         )
         .arg(arg!(--"reset-db" "Reset database before starting node. It's needed when switching between subnetworks.").env("KASPAD_RESET_DB"))
         .arg(arg!(--"enable-unsynced-mining" "Allow the node to accept blocks from RPC while not synced (this flag is mainly used for testing)").env("KASPAD_ENABLE_UNSYNCED_MINING"))
-        .arg(arg!(--"shadow-lthash" "EXPERIMENTAL, DEVNET ONLY. Maintain an LtHash shadow accumulator alongside MuHash for drift measurement. Never affects validation. Costs ~4x multiset CPU and +2KB per chain block."))
+        .arg(arg!(--"shadow-lthash" "EXPERIMENTAL, DEVNET ONLY. Maintain an LtHash shadow accumulator alongside MuHash for drift measurement. Never affects validation. Costs ~1.7x multiset CPU (both accumulators are maintained) and +2KB per chain block."))
         .arg(
             Arg::new("enable-mainnet-mining")
                 .long("enable-mainnet-mining")

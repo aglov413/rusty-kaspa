@@ -1,8 +1,9 @@
 //! # LtHash -- a lattice-based homomorphic multiset hash
 //!
-//! **This is an unaudited experiment.** It is a *shadow* implementation, intended to run
-//! alongside the incumbent MuHash UTXO commitment for comparison. Nothing here is wired
-//! into consensus, and the parameter choice is explicitly unresolved. Read `README.md`
+//! **This is an unaudited experiment.** It is a *shadow* implementation, running alongside the
+//! incumbent MuHash UTXO commitment for comparison. It is wired into consensus only as an
+//! opt-in, devnet-only shadow: computed and persisted alongside MuHash, and never consulted by
+//! any validation decision. The parameter choice is explicitly unresolved. Read `README.md`
 //! before forming any opinion about whether this is safe for anything.
 //!
 //! ## The construction

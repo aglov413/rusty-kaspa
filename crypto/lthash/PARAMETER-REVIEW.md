@@ -110,11 +110,15 @@ group, not a monoid. We assume the adversary has access to both signs.
   script-public-key version 0, 93% coinbase — so the replay establishes scale, not field
   variety. The hand-written vectors still carry the variety coverage.
 * **Live devnet runs.** The drift check — a from-scratch rebuild over the pruning-point UTXO
-  set compared against the incrementally maintained value — has passed **five times**, at five different
-  pruning points and under both expansions. Most recently over **46,271,026 UTXOs**
-  (digest `a868d5b9...fe5b6b8c`) in 118.1 s; the earlier run
-  under cSHAKE256 took 395.4 s over an identical UTXO count at the same pruning point, a
-  controlled 3.6x comparison. Zero errors across roughly 2.7 million cumulative commits.
+  set compared against the incrementally maintained value — has passed at **every pruning point
+  transition observed**, under both expansions, with the complete per-transition record kept in
+  `shadow-lthash-history.jsonl` beside the database. Rebuilds run 2.4–2.6 µs/UTXO over
+  45–47M-element sets under the current expansion, against 8.67 µs/UTXO for the one cSHAKE256
+  rebuild — roughly 3.4–3.6x, but measured at *different* pruning points and UTXO counts, so it
+  is a per-element comparison rather than a controlled one. The controlled measurement is the
+  pruning-point accumulation pass in `README.md`: both expansions over the same pruning point
+  and the same 45,609,558 UTXOs, 406.3 s against 111.9 s, **3.6x**.
+  Zero errors across roughly 2.7 million cumulative commits.
   **Two caveats we want stated: no reorgs have occurred in any run**, so the rollback path is
   unexercised; and the drift check compares LtHash against LtHash, so it validates the
   incremental *lifecycle*, not the implementation — a uniformly wrong encoding would pass it.

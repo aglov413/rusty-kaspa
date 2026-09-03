@@ -45,7 +45,8 @@ pub struct Config {
     /// `header.utxo_commitment`. Its purpose is drift detection across real reorgs and
     /// pruning. See `crypto/lthash/INTEGRATION.md`.
     ///
-    /// Costs roughly 4x the multiset CPU and +2048 bytes per retained chain block.
+    /// Costs roughly 1.7x the multiset CPU -- both accumulators are maintained, and LtHash is
+    /// itself cheaper than MuHash per element -- and +2048 bytes per retained chain block.
     pub shadow_lthash: bool,
 
     // TODO: move non-consensus parameters like utxoindex to a higher scoped Config

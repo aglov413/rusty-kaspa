@@ -42,7 +42,7 @@ use kaspa_consensus_core::{
     trusted::ExternalGhostdagData,
 };
 use kaspa_consensusmanager::SessionLock;
-use kaspa_core::{debug, error, info, trace, warn};
+use kaspa_core::{debug, error, info, time::unix_now, trace, warn};
 use kaspa_database::prelude::{BatchDbWriter, DB, MemoryWriter, StoreResultExt};
 use kaspa_hashes::Hash;
 use kaspa_lthash::{LtHash, LtHashParams};
@@ -50,6 +50,8 @@ use kaspa_muhash::MuHash;
 use kaspa_utils::iter::IterExtensions;
 use parking_lot::RwLockUpgradableReadGuard;
 use rocksdb::WriteBatch;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::{
     collections::{VecDeque, hash_map::Entry::Vacant},
     ops::Deref,
@@ -342,6 +344,10 @@ impl PruningProcessor {
         }
         drop(pruning_meta_read);
 
+        // Recorded before the logging below, and for a mismatch as well as a match: a drift row is
+        // the most valuable row this file could ever hold and must not be the one that is missing.
+        self.record_shadow_lthash_history(pruning_point, count, &stored, &rebuilt);
+
         if rebuilt == stored {
             info!(
                 "[SHADOW-LTHASH] OK -- the incremental shadow matches a from-scratch rebuild over {} UTXOs \
@@ -361,6 +367,62 @@ impl PruningProcessor {
                 stored.digest_hex(),
                 rebuilt.digest_hex()
             );
+        }
+    }
+
+    /// Appends one line to the shadow's pruning-point history, a JSON-lines file beside the
+    /// database.
+    ///
+    /// # Why this is persisted at all
+    ///
+    /// The drift check proves a node agrees with *itself*. Proving LtHash is a viable replacement
+    /// needs agreement between independently operated nodes, and that comparison is impossible
+    /// without a durable record: shadow entries are deleted at pruning, so once a pruning point
+    /// moves no node can ever again say what it computed there. A file makes the comparison
+    /// asynchronous -- two operators intersect their histories on pruning point hash and compare
+    /// wherever both have a row, with no need to be at the same pruning point when they look.
+    ///
+    /// # Why pruning points, and not any other block
+    ///
+    /// A pruning point is the one anchor two independently operated nodes are guaranteed to agree
+    /// on. Rows keyed to anything node-local -- a sink, a tip -- would not be comparable between
+    /// operators at all.
+    ///
+    /// # Why the full state and not just the digest
+    ///
+    /// LtHash is homomorphic, so subtracting two disagreeing states yields the accumulator of
+    /// exactly the symmetric difference of the two UTXO sets: the accumulator of precisely the
+    /// elements the two nodes disagree about, which candidate UTXOs can then be tested against.
+    /// A disagreement is the one moment that is worth 2 KB, and a digest throws it away.
+    ///
+    /// Written beside the database rather than inside it: a foreign file within a RocksDB
+    /// directory is asking for trouble, and this is meant to be read, copied and shared by hand
+    /// long before any RPC exists to serve it.
+    ///
+    /// Failures warn and return. This is research output and must never be able to interfere with
+    /// a node (invariant 3 in `crypto/lthash/INTEGRATION.md`).
+    fn record_shadow_lthash_history(&self, pruning_point: Hash, utxo_count: u64, stored: &LtHash, rebuilt: &LtHash) {
+        let Some(dir) = self.db.path().parent() else {
+            warn!("[SHADOW-LTHASH] cannot locate a directory beside the database; not recording history");
+            return;
+        };
+        let path = dir.join("shadow-lthash-history.jsonl");
+
+        // Absent rather than wrong if the header cannot be read: the row is still comparable
+        // between nodes without it, since the pruning point hash is the join key.
+        let daa_score = self.headers_store.get_daa_score(pruning_point).ok();
+
+        let line = match shadow_lthash_history_row(pruning_point, daa_score, utxo_count, stored, rebuilt, unix_now()) {
+            Ok(line) => line,
+            Err(err) => {
+                warn!("[SHADOW-LTHASH] could not serialize the history row: {}; not recording it", err);
+                return;
+            }
+        };
+
+        match OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| writeln!(f, "{line}")) {
+            Ok(()) => info!("[SHADOW-LTHASH] recorded this pruning point in {}", path.display()),
+            Err(err) => warn!("[SHADOW-LTHASH] could not append to {}: {}; continuing", path.display(), err),
         }
     }
 
@@ -814,5 +876,88 @@ impl PruningProcessor {
             built_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>()
         );
         info!("Trusted data was rebuilt successfully following pruning");
+    }
+}
+
+/// Builds one row of the shadow's pruning-point history.
+///
+/// Split out from [`PruningProcessor::record_shadow_lthash_history`] so the row can be asserted
+/// without standing up a consensus: everything interesting about the record is in this shape, and
+/// the caller only adds the file handling around it.
+fn shadow_lthash_history_row(
+    pruning_point: Hash,
+    daa_score: Option<u64>,
+    utxo_count: u64,
+    stored: &LtHash,
+    rebuilt: &LtHash,
+    recorded_at_ms: u64,
+) -> Result<String, serde_json::Error> {
+    let drifted = rebuilt != stored;
+    serde_json::to_string(&serde_json::json!({
+        "pruning_point": pruning_point.to_string(),
+        "daa_score": daa_score,
+        "utxo_count": utxo_count,
+        // The rebuild, not the incremental value: it is the one derived purely from the UTXO set,
+        // so it is what another node's rebuild is comparable to.
+        "digest": rebuilt.digest_hex(),
+        "state": rebuilt.serialize().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "outcome": if drifted { "drift" } else { "ok" },
+        // Only on a drift, and present so the two states can be subtracted later.
+        "incremental_digest": drifted.then(|| stored.digest_hex()),
+        // Recorded so rows can never be silently compared across a parameter change.
+        "params": { "lanes": LtHashParams::default().lanes(), "lane_bits": LtHashParams::default().lane_bits() },
+        "recorded_at_ms": recorded_at_ms,
+    }))
+}
+
+#[cfg(test)]
+mod shadow_lthash_history_tests {
+    use super::*;
+
+    fn state(elements: &[&[u8]]) -> LtHash {
+        let mut h = LtHash::new(LtHashParams::default());
+        for e in elements {
+            h.add_element(e);
+        }
+        h
+    }
+
+    /// A matching check records the digest another node's rebuild can be compared against, and
+    /// carries no incremental digest because there is nothing to subtract.
+    #[test]
+    fn agreeing_row_is_comparable_and_carries_no_incremental_digest() {
+        let s = state(&[b"a", b"b"]);
+        let line = shadow_lthash_history_row(Hash::from_bytes([7; 32]), Some(1234), 99, &s, &s, 1700000000000).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(v["outcome"], "ok");
+        assert_eq!(v["utxo_count"], 99);
+        assert_eq!(v["daa_score"], 1234);
+        assert_eq!(v["digest"], s.digest_hex());
+        assert!(v["incremental_digest"].is_null());
+        assert_eq!(v["params"]["lanes"], LtHashParams::default().lanes());
+        assert_eq!(v["params"]["lane_bits"], LtHashParams::default().lane_bits());
+        // One line, so the file stays append-only JSON-lines.
+        assert!(!line.contains('\n'));
+    }
+
+    /// A drift row is the one that has to survive: it keeps both digests, and the full rebuilt
+    /// state, so the difference between two nodes can still be reconstructed afterwards.
+    #[test]
+    fn drift_row_keeps_both_digests_and_the_full_state() {
+        let stored = state(&[b"a"]);
+        let rebuilt = state(&[b"a", b"unexpected"]);
+        let line = shadow_lthash_history_row(Hash::from_bytes([9; 32]), None, 5, &stored, &rebuilt, 1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(v["outcome"], "drift");
+        assert_eq!(v["digest"], rebuilt.digest_hex());
+        assert_eq!(v["incremental_digest"], stored.digest_hex());
+        assert!(v["daa_score"].is_null(), "an unreadable header must be absent, not wrong");
+
+        // The state must round-trip, since subtracting two of them is the whole point of storing it.
+        let hex = v["state"].as_str().unwrap();
+        let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        assert_eq!(LtHash::deserialize(LtHashParams::default(), &bytes).unwrap(), rebuilt);
     }
 }

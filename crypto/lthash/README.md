@@ -528,12 +528,14 @@ than +406 s.
 ### Lifecycle: the drift check
 
 The drift check rebuilds LtHash from scratch over the pruning-point UTXO set and compares it
-against the value maintained incrementally. It has now passed five times, at five different
-pruning points:
+against the value maintained incrementally. It has passed at **every pruning point transition
+observed**. The runs below are the ones timed by hand; from 2026-09-03 every transition is
+recorded automatically in `shadow-lthash-history.jsonl` beside the database, which is the
+complete record:
 
 | Run | Expansion | Pruning point | UTXOs | Rebuild | Result |
 |---|---|---|---:|---:|---|
-| 1 | cSHAKE256 | `f1500710…` | 45,609,558 | 395.4 s | **match** |
+| 1\* | cSHAKE256 | `f1500710…` | 45,609,558 | 395.4 s | **match** |
 | 2 | `Blake2b-256 -> ChaCha20` | `5da60587…` | 45,471,168 | 111.6 s | **match** |
 | 3 | `Blake2b-256 -> ChaCha20` | `19f30664…` | 45,985,164 | 115.1 s | **match** |
 | 4 | `Blake2b-256 -> ChaCha20` | `be39bfa0…` | 46,111,403 | 115.4 s | **match** |
@@ -548,8 +550,13 @@ In every case the pruning point had *moved* since the shadow was imported, so th
 checked was accumulated block-by-block through `commit_utxo_state` — not the one written at
 import. Zero errors and zero warnings across all runs.
 
-Throughput is consistent across every pass under the current expansion: 2.45–2.55 µs/UTXO,
-on 45.5–46.3M-element sets.
+\* Run 1 is the only cSHAKE256 rebuild, and it sits at a different pruning point and UTXO
+count from every current-expansion run, so comparing it to them is per-element (8.67 µs/UTXO
+against 2.4–2.6 µs/UTXO) rather than controlled. The controlled expansion comparison is the
+accumulation pass above, where both expansions ran over the identical set.
+
+Throughput is consistent across every pass under the current expansion: 2.4–2.6 µs/UTXO,
+on 45.5–46.9M-element sets.
 
 ### What the drift check does and does not prove
 

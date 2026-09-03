@@ -181,10 +181,11 @@ a statement about mainnet viability.
 
 1. **Phase 1 — plumbing.** *(done)* Every change landed, additive, shadow disabled by default.
 2. **Phase 2 — enable on devnet.** *(done, partially)* Synced from scratch with
-   `--shadow-lthash`. The drift check has now passed **five times**, at five different pruning
-   points and under both expansions — most recently over 46,271,026 UTXOs, zero errors. **Incomplete: no reorgs have occurred in any of three runs**, so the
-   rollback path — the likeliest source of drift, and the reason §1 argues for a live shadow
-   at all — is still unexercised. Devnet at 10 bps does not appear to produce competing chains
+   `--shadow-lthash`. The drift check has passed at **every pruning point transition observed**,
+   under both expansions, with zero errors; the complete per-transition record is kept in
+   `shadow-lthash-history.jsonl` beside the database. **Incomplete: no reorgs have occurred in
+   any run**, so the rollback path — the likeliest source of drift, and the reason §1 argues
+   for a live shadow at all — is still unexercised. Devnet at 10 bps does not appear to produce competing chains
    on its own; forcing a reorg deliberately would be more reliable than waiting.
 3. **Phase 3 — report.** *(done for what Phase 2 covered)* Results are in
    `PARAMETER-REVIEW.md` §4 and `README.md`.
@@ -203,8 +204,8 @@ reorg has been observed.
   `wrapping_*` and total, store errors disable the shadow rather than propagating, and the
   drift check logs instead of asserting. One violation of this invariant was found and fixed
   during implementation (see §9, `combine`).
-- **The reorg path is unexercised.** Zero reorgs across every run, including ~37 h of
-  continuous uptime and four pruning-point transitions on the latest node alone. Waiting has
+- **The reorg path is unexercised.** Zero reorgs across every run, including ~55 h of
+  continuous uptime and five pruning-point transitions on the latest node alone. Waiting has
   not produced one; a deliberate test is the reliable path. This is the largest
   remaining gap in the engineering evidence, and waiting has not closed it.
 - **The drift check has no external anchor.** It compares LtHash against LtHash, so a
@@ -281,6 +282,25 @@ which can be read directly.
   it alive. The result is keyed and pruned identically to what a fresh sync would have written.
   Startup blocks for the duration — one full UTXO-set pass plus the replay. Every failure path
   abandons the backfill and leaves the node reporting no shadow, per invariant 3.
+
+* **Every drift check is recorded to `shadow-lthash-history.jsonl`, beside the database.** The
+  drift check only proves a node agrees with *itself*. Establishing LtHash as a viable
+  replacement needs agreement between independently operated nodes, and that is impossible to
+  compare without a durable record: shadow entries are deleted at pruning, so once a pruning
+  point moves, no node can ever again say what it computed there. One JSON line per check makes
+  the comparison asynchronous — two operators intersect their histories on pruning point hash and
+  compare wherever both have a row, without needing to be at the same pruning point when they
+  look. Rows are anchored to **pruning points only**, because a pruning point is the one thing
+  two independently operated nodes are guaranteed to agree on; anything node-local (a sink, a
+  tip) would not be comparable across operators at all. Both outcomes are recorded, `ok` and
+  `drift` — a drift row is the most valuable row the file could hold and must not be the one
+  that is missing. Each row carries the full 2048-byte state as well as the digest: LtHash is
+  homomorphic, so subtracting two disagreeing states yields the accumulator of exactly the
+  symmetric difference of the two UTXO sets, which candidate UTXOs can then be tested against.
+  The parameters are recorded too, so rows can never be silently compared across a parameter
+  change. Written beside the database rather than inside it (a foreign file in a RocksDB
+  directory invites trouble), and every failure warns and returns — this is research output and
+  must never interfere with a node.
 
 * **The backfill cross-checks itself against any shadow that survived.** Turning the flag *off*
   for a while and back on leaves the earlier entries in place, because pruning only deletes them

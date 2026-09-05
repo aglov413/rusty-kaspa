@@ -119,10 +119,14 @@ group, not a monoid. We assume the adversary has access to both signs.
   pruning-point accumulation pass in `README.md`: both expansions over the same pruning point
   and the same 45,609,558 UTXOs, 406.3 s against 111.9 s, **3.6x**.
   Zero errors across roughly 2.7 million cumulative commits.
-  **Two caveats we want stated: no reorgs have occurred in any run**, so the rollback path is
-  unexercised; and the drift check compares LtHash against LtHash, so it validates the
-  incremental *lifecycle*, not the implementation — a uniformly wrong encoding would pass it.
-  The external anchor for the encoding is §6.1's 44.7M-UTXO replay, not this check.
+  **Two caveats we want stated. First, we cannot report a reorg count**, because nothing in the
+  node logs a reorg — so these runs claim neither reorg coverage nor its absence. The reorg path
+  is not LtHash-specific (both accumulators travel in one value and are restored by the same
+  lookup), and a reorg that had broken the shadow would surface at the next pruning point as a
+  missing comparison; none has. **Second**, the drift check compares LtHash against LtHash, so it
+  validates the incremental *lifecycle*, not the implementation — a uniformly wrong encoding
+  would pass it. The external anchor for the encoding is §6.1's 44.7M-UTXO replay, not this
+  check.
 * **Performance.** Per element: MuHash 2.68 us, LtHash **1.77 us** — LtHash is **1.5x
   faster**, and also 26x faster on union and 13x on finalize (MuHash's `normalize()` performs
   a 3072-bit modular division). Only `clone` is slower (78 ns vs 18 ns, 2048 vs 384 bytes).

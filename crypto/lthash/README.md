@@ -43,6 +43,42 @@ whether this should ever *replace* MuHash — remain firmly out of scope and are
 
 ---
 
+## Where things are documented
+
+This README is the crate's own reference: the construction in brief, **the benchmarks**, the
+real-data and live-devnet results, and how to run the tests. The deeper material lives in three
+companion documents, and is deliberately *not* repeated here.
+
+| Document | Owns |
+|---|---|
+| `PARAMETER-REVIEW.md` | The request for cryptographic review. The construction in full (§2), why `(1024, 16)` (§1, §3), the ~2^128 binding cap and why it was accepted (§5.1), Wagner (§5.2), the UTXO element layout and adversarial freedom per field (§6.1), and the open questions (§7). |
+| `INTEGRATION.md` | How the shadow is wired into consensus: safety invariants (§2), the one-source encoding rule (§3), change sites (§4), what the shadow validates (§5), rollout (§7), known risks (§8), and the cross-node gap (§8b). |
+| `MUHASH-SURVEY.md` | How MuHash behaves in this codebase today — notably §4c, the reorg/backout path the shadow had to match. |
+
+When a claim here is a summary of one of those, it links to it rather than restating it.
+
+
+---
+
+## Usage
+
+```rust
+use kaspa_lthash::{LtHash, LtHashParams};
+
+let mut acc = LtHash::new(LtHashParams::default());   // (1024, 16); identity = all-zero
+acc.add_element(b"utxo-encoding-bytes");
+acc.remove_element(b"utxo-encoding-bytes");           // exact inverse, any order
+
+let resumable: Vec<u8> = acc.serialize();             // 2048 bytes — persist THIS
+let commitment = acc.digest();                        // 32 bytes — terminal, not resumable
+```
+
+Inside consensus the accumulator is never driven directly: `LtHashExtensions` in
+`consensus/core/src/lthash.rs` calls `muhash::encode_utxo`, so both accumulators are fed
+byte-identical elements by construction. See `INTEGRATION.md` §3.
+
+
+---
 ## The construction
 
 A state is a point in the abelian group `(Z_{2^W})^N` — `N` lanes of `W` bits, added
@@ -63,55 +99,24 @@ lane-wise with wrapping arithmetic.
 the whole point is to be able to sweep them. Any `N >= 1` and any `W` in `1..=64` works,
 including widths that are not a multiple of 8.
 
-### Element expansion
+
+### Element expansion, in brief
 
 ```text
 seed(x)  = Blake2b-256(key = "LtHashElement:n=<N>,w=<W>", message = x)   -> 256 bits
-lanes(x) = canonical_unpack( ChaCha20(key = seed(x), nonce = 0, counter = 0)
-                             read for ceil(N*W/8) bytes )
+lanes(x) = canonical_unpack( ChaCha20(key = seed(x), nonce = 0, counter = 0) )
 ```
 
-**The same shape the incumbent MuHash uses** (`crypto/muhash/src/lib.rs::data_to_element`:
-Blake2b-256 keyed `b"MuHashElement"`, then `ChaCha20Rng::from_seed`), which is in turn the
-shape Bitcoin Core's MuHash3072 uses. Three reasons:
+This deliberately **mirrors MuHash's own expansion** (`crypto/muhash/src/lib.rs`), which is in
+turn the shape Bitcoin Core's MuHash3072 uses — so a migration changes only the group the
+accumulator lives in, adds no new primitives, and keeps any divergence attributable to the
+algebra rather than the expansion.
 
-1. **A minimal-diff migration.** If LtHash replaces MuHash, element hashing is unchanged and
-   *only the group the accumulator lives in* changes — far easier to review than a change to
-   two things at once.
-2. **No new primitives.** `blake2b_simd` and `rand_chacha` are already in this repository.
-3. **Comparability.** Holding the hash-to-element step constant means an observed divergence
-   between the accumulators is attributable to the algebra, not the expansion.
-
-#### The 256-bit intermediate, stated plainly
-
-`H` factors through a 256-bit value, so **any Blake2b-256 collision is immediately an LtHash
-collision** — binding is capped at ~2^128 regardless of how large `N*W` is. That admits a
-*targeted* attack on a published commitment: find a colliding pair offline for ~2^128, publish
-one ordinary transaction creating one of them as a UTXO, then substitute the other with the
-accumulator state, and so the header commitment, bit-for-bit unchanged.
-
-**This is a deliberate, documented acceptance of ~128-bit classical binding**, on four grounds:
-
-* 128 bits is where the rest of the stack already sits — secp256k1 is ~128-bit, Blake2b-256
-  collision resistance is ~2^128. A 256-bit-binding commitment guarded by 128-bit signatures
-  buys nothing that can be spent.
-* **Solana ships this security level for this construction at these parameters.** Their
-  Accounts Lattice Hash (SIMD-0215) is LtHash at `N = 1024`, `W = 16` — identical to ours —
-  expanded with the BLAKE3 XOF, whose 256-bit chaining value imposes the same cap. The
-  proposal states 128-bit as the design target. *Caveat: the SIMD cites Wagner in its
-  bibliography but presents no analysis of it. Precedent, not proof.*
-* **The cap does not undermine the post-quantum rationale.** That rationale is that Shor
-  solves MuHash's group problem in *polynomial* time. The best known quantum attack here is
-  generic collision search — ~2^85 under BHT assuming quantum RAM nobody knows how to build,
-  plausibly no better than classical in practice. The cap lowers the ceiling; it does not
-  restore a catastrophic failure mode.
-* **The alternative costs ~4x.** A 2048-byte expansion is 1.26 µs this way against 6.62 µs
-  with cSHAKE256 — the difference between LtHash being 1.4x *faster* than MuHash per element
-  and 2.7x slower.
-
-An earlier revision used cSHAKE256 applied directly to the element (~2^256 binding, no
-intermediate). It is preserved in git history and remains the conservative option.
-**Whether this trade is right is `PARAMETER-REVIEW.md` Q3, and it is not settled.**
+`H` factors through a 256-bit intermediate, which **caps binding at ~2^128 regardless of
+`N*W`**. That is a deliberate, documented acceptance, not an oversight, and an earlier
+cSHAKE256 revision (~2^256, ~4x the cost) was reverted to get here. The full argument, the
+Solana precedent, and the counter-arguments are `PARAMETER-REVIEW.md` §5.1 — and whether the
+trade is right is its **Q3**, which is not settled.
 
 ### Digest
 
@@ -136,125 +141,49 @@ block in `utxo_multisets_store`.
 
 ---
 
-## Parameter choice: (1024, 16) selected — security level still pending review
 
-`N = 1024`, `W = 16` is **the selected parameterisation**, and the choice is deliberate
-rather than inherited-by-default.
+## Parameters and security — see `PARAMETER-REVIEW.md`
 
-**Rationale.** It is the only LtHash parameter set that has actually been studied — it is
-what Lewi et al. analyse. Any smaller set would be novel parameters requiring their own
-cryptographic analysis, which is precisely the expensive thing a shrink was supposed to
-avoid. The storage saving available from shrinking (see `PARAMETER-REVIEW.md` §5.1, roughly
-1.7 GB at 10 bps) is not worth moving off analysed ground. Over-provisioning is accepted
-knowingly, including in the presence of the seed-collision cap described below.
+`(1024, 16)` is *selected*, not *justified*. The security level it delivers has not been
+checked by a cryptographer, and this README makes no claim about it.
 
-**What is settled:** the choice of `(N, W)`. It is not an open question and should not be
-relitigated on storage grounds.
+Two things worth knowing before reading any number below:
 
-**What is NOT settled, and still needs a cryptographer:** the security level those
-parameters actually deliver under this deployment's threat model. Specifically:
+* **The parameters are set by a classical attack, not a quantum one.** Wagner's generalized
+  birthday attack is what constrains `(N, W)`; choosing LtHash buys no margin against it
+  whatsoever. The post-quantum motivation concerns Shor against MuHash's group, and is a
+  separate axis. `PARAMETER-REVIEW.md` §5.2.
+* **Binding is capped at ~2^128** by the 256-bit expansion intermediate, knowingly. §5.1.
 
-- Is 16384 bits of state adequate against Wagner's generalized birthday attack for a
-  commitment that must remain binding for the lifetime of the chain? Published estimates
-  (~200 bits) and this repo's own naive k-tree model (~255 bits) disagree by ~55 bits and
-  the discrepancy is unexplained.
-- Was replacing the expansion the right call? The original `Blake2b-256 -> ChaCha20` shape
-  caps binding at ~2^128 independently of `(N, W)`. We accept that knowingly — see the
-  expansion section above and `PARAMETER-REVIEW.md` §5.1 — for reasons including that Solana
-  ships the same level for the same construction. cSHAKE256 removes the cap at ~4x the cost.
-  Whether the acceptance is right is Q3.
-- Does lattice reduction on the corresponding SIS instance beat the k-tree attack here?
+The parameter sweep that informed the choice is under "Parameter sweep" below; the reasoning
+and the open questions are §1, §3, §5 and §7 of the review packet.
 
-`PARAMETER-REVIEW.md` is the review request covering exactly these. Do not resolve them by
-reading this README.
-
----
-
-## ⚠️ Security rests on resistance to Wagner's generalized birthday attack — a *classical* attack
-
-The motivation for LtHash is post-quantum safety, but **the attack that actually determines
-the parameters is classical**. This is the single most important thing to understand about
-the scheme, and it is easy to get backwards.
-
-Finding a collision means finding a set of elements whose expansions sum to zero lane-wise
-modulo `2^W` — a `k`-sum problem over `(Z_{2^W})^N`. The best known generic attack is
-**Wagner's generalized birthday attack** (*"A Generalized Birthday Problem"*, CRYPTO 2002)
-and its refinements. Wagner's algorithm trades more list entries for less work: allowing the
-adversary to combine `k = 2^t` elements instead of 2 reduces the cost from the naive
-birthday bound to roughly `2^(b / (1 + t))` for a `b`-bit target, at the cost of holding
-lists of that size.
-
-Three consequences worth being explicit about:
-
-1. **Wagner runs on a classical computer.** Choosing LtHash over MuHash buys resistance to
-   Shor. It does not buy any margin against Wagner. The parameters must be large enough to
-   defeat Wagner *before* quantum computers enter the discussion at all.
-2. **`N*W` bits of state does not mean `N*W` bits of security, or even `N*W/2`.** Wagner's
-   attack is precisely the reason the state has to be kilobytes rather than tens of bytes.
-   Lewi et al. quote roughly 200 bits of classical security for `(1024, 16)`; that figure is
-   *quoted here, not independently verified*, and it is exactly the kind of number that
-   should be re-derived under review rather than inherited.
-3. **Quantum variants of Wagner exist** and give a modest further speedup over the classical
-   version. "Post-quantum" here means "no known catastrophic quantum break", not "quantum
-   attacks are irrelevant".
-
-There is a second, more mundane property to keep in view: **removals fail silently**. There
-is no membership test. Removing an element that was never added is not an error — it
-produces a well-formed state that simply corresponds to a different multiset than intended,
-and it will keep producing well-formed states forever afterwards. The first symptom is a
-commitment mismatch at some unrelated later point, with nothing pointing at where the drift
-started. That is inherent to any group-based multiset hash, MuHash included, and it is
-documented by the `removing_never_added_element_is_silent_and_reversible` property test
-rather than defended against.
 
 ---
 
 ## Byte-identical element encoding with MuHash
 
-This is the load-bearing requirement. Both accumulators must hash byte-identical element
-encodings, or a later comparison measures the encoding difference instead of the accumulator
-difference.
+The load-bearing requirement: both accumulators must hash byte-identical element encodings, or
+any later comparison measures the encoding difference instead of the accumulator difference.
 
-`src/encoding.rs` reproduces `consensus/core/src/muhash.rs::write_utxo` exactly:
+`src/encoding.rs` reproduces `consensus/core/src/muhash.rs::write_utxo` exactly. **The field
+layout, and how much freedom an adversary has over each field, is `PARAMETER-REVIEW.md` §6.1**;
+the architectural rule that keeps there being exactly one implementation inside consensus is
+`INTEGRATION.md` §3.
 
-```text
-offset  size  field                             encoding
-------  ----  --------------------------------  --------------------------------
-0       32    outpoint.transaction_id           raw 32 bytes
-32      4     outpoint.index                    u32 little-endian
-36      8     entry.block_daa_score             u64 little-endian
-44      8     entry.amount                      u64 little-endian
-52      1     entry.is_coinbase                 0x01 / 0x00
-53      2     script_public_key.version         u16 little-endian
-55      8     script_public_key.script().len()  u64 little-endian
-63      L     script_public_key.script()        raw bytes
-------  ----
-total = 63 + L
-```
+Three traps, each of which produces a plausible-looking but incompatible encoding:
 
-Three traps, all of which produce a plausible-looking but incompatible encoding:
-
-1. **DAA score is written before amount** — the opposite of the `UtxoEntry` struct's field
-   order.
-2. **The script length is a fixed 8-byte little-endian `u64`**, not a varint.
+1. **DAA score is written before amount** — the opposite of the `UtxoEntry` struct field order.
+2. **Script length is a fixed 8-byte little-endian `u64`**, not a varint.
 3. **The domain separator is a Blake2b *key*, not a message prefix.**
 
-Equality with the consensus implementation was verified empirically, not just by reading:
-`write_utxo` is private, but its output is observable through the accumulator, so a
-throwaway harness checked that
+Parity was verified empirically rather than by reading — `write_utxo` is private, but its output
+is observable through the accumulator — and the resulting digests are frozen as golden vectors
+in `tests/muhash_encoding_vectors.rs`, so any future layout change fails loudly. The harness and
+re-run instructions are in the appendix of `MUHASH-SURVEY.md`.
 
-```text
-MuHash::new().add_utxo(op, entry).finalize()
-  == MuHash::new().add_element(encode_utxo(op, entry)).finalize()
-```
-
-for a range of cases including all-zero, all-max, and long-script UTXOs. It reported
-`ALL_MATCH=true`. The harness source and instructions for re-running it are in the appendix
-of `MUHASH-SURVEY.md`. The resulting digests are frozen as golden vectors in
-`tests/muhash_encoding_vectors.rs`, so any future change to the layout fails loudly.
 
 ---
-
 ## Measured performance vs. MuHash
 
 Both crates benched with criterion 0.5.1 under an identical `[profile.release]`
@@ -313,21 +242,14 @@ as a regression guard — they now measure 420 ns and 413 ns respectively.
 ### Alternatives considered
 
 Every expansion that removes the ~2^128 cap costs materially more, and every *faster* one has
-the same cap. That is structural: 256-bit collision resistance requires a >= 512-bit internal
-state to survive the birthday bound, and carrying that state is the cost.
+the same cap — structural, since 256-bit collision resistance needs a >= 512-bit internal state
+to survive the birthday bound. The measured comparison of all five candidates (`Blake2b-256 ->
+ChaCha20`, BLAKE3 XOF, Blake2b-512 counter mode, cSHAKE256, SHAKE128/AES-CTR) is the table in
+`PARAMETER-REVIEW.md` §5.1.
 
-| Candidate | 2048-byte expansion | Binding | Verdict |
-|---|---:|---|---|
-| **`Blake2b-256 -> ChaCha20`** | **1.26 µs** | ~2^128 | **chosen** — mirrors MuHash, no new dependency |
-| BLAKE3 XOF (Solana's choice) | 1.69 µs | ~2^128 | same cap, slower here, adds a dependency |
-| Blake2b-512 counter mode (Blake2X-style) | 3.78 µs | ~2^256 | rejected: needs a length prefix to disambiguate `data \|\| counter`, the kind of encoding hazard a standardised XOF removes |
-| cSHAKE256 | 6.62 µs | ~2^256 | the conservative option, ~4x the cost; used in an earlier revision, preserved in git history |
-| SHAKE128 / AES-CTR | — | ~2^128 | 256-bit capacity / key gives the same cap as the chosen option, with no advantage |
-
-Note BLAKE3 measured *slower* than ChaCha20 here — its SIMD advantage needs inputs larger than
-2 KB to show. Choosing ChaCha20 over BLAKE3 costs nothing in security (identical cap) and
-avoids adding a dependency; the Solana precedent is about the security *level*, not the
-specific primitive.
+Worth noting BLAKE3 measured *slower* than ChaCha20 here — its SIMD advantage needs inputs
+larger than 2 KB. Choosing ChaCha20 over BLAKE3 costs nothing in security (identical cap) and
+avoids a dependency; the Solana precedent is about the security *level*, not the primitive.
 
 ### Illustrative block-level cost
 
@@ -463,30 +385,19 @@ The first match proves the harness faithfully reproduces consensus; without it t
 would be meaningless. The second proves the encoding in `src/encoding.rs` is byte-identical
 to the private `write_utxo` over 44.7 million real UTXOs rather than five hand-picked vectors.
 
+
 ### ⚠️ What this does NOT establish
 
-The field distribution of this chain is extremely narrow:
+The field distribution of this chain is extremely narrow — every script exactly 34 bytes, only
+script-public-key version 0, 93.4% coinbase. So the replay adds enormous confidence in **scale**
+and none in **field variety**: it never exercises a variable-length script, an empty script, or
+a non-zero version.
 
-| field | observed |
-|---|---|
-| script length | min 34 / mean 34.0 / **max 34** — every script identical in length |
-| SPK version | `{0: 44663940}` — only version 0 |
-| coinbase | 93.37% |
-
-So the replay adds enormous confidence in **scale and volume** and none at all in **field
-variety**. It never exercises a variable-length script, so the 8-byte `write_var_bytes`
-length prefix is only ever observed encoding the value 34; it never exercises an empty
-script, a large script, or a non-zero script-public-key version.
-
-The frozen vectors in `tests/muhash_encoding_vectors.rs` cover strictly *more* field variety
-than this real data does — empty script, 600-byte script, version `0xBEEF`, all-max fields.
-**The two are complementary and neither supersedes the other.** A claim that the encoding is
-validated across "the real distribution" would be wrong; it is validated across a real
-distribution that happens to be nearly uniform.
-
-The same caveat applies to `PARAMETER-REVIEW.md` §6.1: this data neither confirms nor refutes
-the assumption that an adversary has effectively free choice of the script field. Devnet
-simply has no script variety to observe. Mainnet would be the place to check that.
+The frozen vectors cover strictly *more* variety than the real data does (empty script, 600-byte
+script, version `0xBEEF`, all-max fields). **The two are complementary and neither supersedes the
+other.** The same caveat bears on `PARAMETER-REVIEW.md` §6.1: devnet has no script variety to
+observe, so this data neither confirms nor refutes the assumption that an adversary has free
+choice of the script field. Mainnet would be the place to check.
 
 ### Throughput on real data
 
@@ -558,49 +469,46 @@ accumulation pass above, where both expansions ran over the identical set.
 Throughput is consistent across every pass under the current expansion: 2.4–2.6 µs/UTXO,
 on 45.5–46.9M-element sets.
 
+
 ### What the drift check does and does not prove
 
-Worth being precise, because it is weaker evidence than MuHash's equivalent.
+It compares two genuinely different **code paths** — incremental accumulation against a single
+batch pass — so a missed accumulation site, a wrong reorg restore or a mistimed pruning deletion
+would fail it. It cannot pass vacuously: with no stored shadow it logs "nothing to compare yet"
+rather than `OK`.
 
-It compares two genuinely different **code paths** — incremental accumulation versus a single
-batch pass — so a missed accumulation site, a wrong reorg restore, or a mistimed pruning
-deletion would fail it. It cannot pass vacuously either: with no stored shadow it logs
-"nothing to compare yet" rather than `OK`.
+But **both sides are LtHash**. A uniformly wrong implementation — wrong encoding, wrong domain
+separator — would be wrong identically on both sides and still pass. MuHash's
+`assert_utxo_commitment` is anchored to an *external* reference; this is anchored only to itself.
+The external anchor is the encoding work above, not this check.
 
-But both sides are LtHash. **If the implementation were uniformly wrong — wrong encoding,
-wrong domain separator — both sides would be wrong identically and the check would still
-pass.** MuHash's `assert_utxo_commitment` is anchored to an *external* reference (a header
-other nodes produced); ours is anchored only to itself.
-
-What supplies the external anchor is the encoding work, not the drift check: the frozen
-vectors and the 44.7M-UTXO replay, where MuHash driven by *our* bytes reproduced a real
-header's `utxo_commitment`.
-
-Note also that `assert_utxo_commitment` runs immediately before the drift check over the same
-UTXO-set iteration (`enable_sanity_checks` is hardcoded true in `kaspad/src/args.rs`). The two
-compose: MuHash establishes that the set on disk is what the network committed to, and the
-drift check establishes that LtHash describes that same set. Observed at run 2's pruning
-point, MuHash's rebuild took 2m34s against LtHash's 1m52s.
+The two do compose, though: `assert_utxo_commitment` runs immediately before the drift check over
+the same UTXO-set iteration (`enable_sanity_checks` is hardcoded true in `kaspad/src/args.rs`), so
+MuHash establishes that the set on disk is what the network committed to, and the drift check
+establishes that LtHash describes that same set. At run 2's pruning point MuHash's rebuild took
+2m34s against LtHash's 1m52s.
 
 ### ⚠️ What this does NOT establish
 
-**Reorg survival.** Zero reorgs occurred in any of three multi-hour runs — no chain
-disqualifications, no finality violations, across roughly 2.7 million cumulative chain-block
-commits. The rollback path is the single most likely source of drift (`MUHASH-SURVEY.md` §4c:
-the accumulator is never rolled back, it is re-read wholesale from its store) and it remains
-unexercised. Devnet at 10 bps with few peers does not appear to produce competing chains on
-its own; deliberately forcing a reorg would be more reliable than waiting.
+**A reorg count.** Nothing in the node logs a reorg, so no run can report one; an earlier claim of
+"zero reorgs" was the absence of an indicator that does not exist, and is withdrawn. The reorg
+path is not LtHash-specific — both accumulators travel in one value and are restored by the same
+lookup — and the one LtHash-specific failure mode would surface at the next pruning point as a
+missing comparison. It has not. Full reasoning in `INTEGRATION.md` §8.
 
-**Cross-node agreement.** Nothing verifies that a *different* node computes the same LtHash,
-because no header carries one — each node only checks itself. Closing this needs visibility,
-not consensus: exposing the shadow digest over RPC and comparing across operators would
-establish it with no header change and no fork. See `INTEGRATION.md` §4b.
+**Cross-node agreement — one data point.** On 2026-09-04 two independently operated nodes produced
+byte-identical rows at a shared pruning point (`f1caa6c3dacd…`, 47,496,442 UTXOs, `(1024, 16)`,
+`OK` on both). What agreed was two independent *from-scratch rebuilds* over UTXO sets MuHash had
+each separately verified. But it is n=1, between instances of a single implementation, both seeded
+by the same mechanism, compared by hand. `INTEGRATION.md` §8b has the detail and the limits.
 
 **Parameter security.** Unaddressed here; see `PARAMETER-REVIEW.md`.
 
 **Encoding correctness.** Covered by the 44.7M-UTXO replay and the frozen vectors, not by the
 drift check — see the note above on what the drift check can and cannot catch.
 
+
+---
 ## Testing
 
 ```bash

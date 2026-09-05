@@ -183,15 +183,13 @@ a statement about mainnet viability.
 2. **Phase 2 — enable on devnet.** *(done, partially)* Synced from scratch with
    `--shadow-lthash`. The drift check has passed at **every pruning point transition observed**,
    under both expansions, with zero errors; the complete per-transition record is kept in
-   `shadow-lthash-history.jsonl` beside the database. **Incomplete: no reorgs have occurred in
-   any run**, so the rollback path — the likeliest source of drift, and the reason §1 argues
-   for a live shadow at all — is still unexercised. Devnet at 10 bps does not appear to produce competing chains
-   on its own; forcing a reorg deliberately would be more reliable than waiting.
+   `shadow-lthash-history.jsonl` beside the database. **How many reorgs this covers is unknown,
+   because nothing logs a reorg** — no run can report a count in either direction. See §8.
 3. **Phase 3 — report.** *(done for what Phase 2 covered)* Results are in
    `PARAMETER-REVIEW.md` §4 and `README.md`.
 
-Phase 1 was where the risk was. Phase 2 is where the value is, and it is not finished until a
-reorg has been observed.
+Phase 1 was where the risk was. Phase 2 is where the value is; what it still lacks is
+accumulated runtime and more than a single cross-node data point (§8b), not a reorg.
 
 ## 8. Known risks
 
@@ -204,10 +202,28 @@ reorg has been observed.
   `wrapping_*` and total, store errors disable the shadow rather than propagating, and the
   drift check logs instead of asserting. One violation of this invariant was found and fixed
   during implementation (see §9, `combine`).
-- **The reorg path is unexercised.** Zero reorgs across every run, including ~55 h of
-  continuous uptime and five pruning-point transitions on the latest node alone. Waiting has
-  not produced one; a deliberate test is the reliable path. This is the largest
-  remaining gap in the engineering evidence, and waiting has not closed it.
+- **Reorgs are not counted, and the shadow has no reorg-specific code.** Earlier drafts called
+  the reorg path unexercised and reported "zero reorgs". Both were wrong. Nothing in the node
+  logs a reorg — `calculate_utxo_state_relatively` logs its split point at `debug!`, and that
+  line fires on every virtual resolution whether or not one occurred — so no run has ever been
+  in a position to report a count. "Zero" was the absence of an indicator that does not exist,
+  not an observation, and it is withdrawn.
+
+  What holds structurally is stronger than the count would have been. `ShadowedMuHash`
+  (`consensus/core/src/shadowed_muhash.rs`) carries the MuHash and the `Option<LtHash>` in one
+  value and applies every mutating operation to both in lockstep; the reorg site
+  (`virtual_processor/processor.rs:492`) restores state through the same
+  `load_shadowed_multiset(selected_parent)` call the linear path uses at `:359`. There is no
+  LtHash-specific reorg branch that could be unexercised — LtHash is restored by lookup exactly
+  as MuHash is (`MUHASH-SURVEY.md` §4c), on code that predates this work.
+
+  The one LtHash-specific behaviour is the `Option` degrading to `None` when no shadow is
+  stored at the new selected parent. That is fail-safe by design and, importantly, *detectable*:
+  the entry for the next pruning point would then be missing and the drift check logs "no stored
+  shadow … nothing to compare yet" in place of `OK`. Every observed transition logged `OK`. So
+  the defensible claim is **no reorg has broken the shadow in a way the drift check would catch
+  within one pruning interval** — not that no reorg occurred. Converting this into a count needs
+  one INFO line on the reorg path: cheap, and not yet done.
 - **The drift check has no external anchor.** It compares LtHash against LtHash, so a
   uniformly wrong implementation would pass. The external anchor is the encoding work — the
   frozen vectors and the 44.7M-UTXO replay — not the drift check. See §8b for the related
@@ -230,11 +246,40 @@ field changes the pre-PoW input and forces every miner and pool to update, not j
 operators; it adds 32 bytes to every archival header (~27 MB/day at 10 bps); and it needs its
 own hard fork to introduce, before the fork that switches over.
 
-**Cross-node agreement needs visibility, not consensus.** Exposing the shadow digest over RPC
-— the verbosity machinery already carries `include_utxo_commitment`, so there is a natural
-place — lets several operators run `--shadow-lthash` and compare digests at the same pruning
-point. That establishes the same property with no header change, no mining impact, and no
-fork, and it can be done during the shadow phase rather than requiring a preliminary one.
+**Cross-node agreement needs visibility, not consensus.** Several operators run
+`--shadow-lthash` and compare values at a shared pruning point. That establishes the same
+property with no header change, no mining impact and no fork, during the shadow phase rather
+than requiring a preliminary one.
+
+**First cross-node match, 2026-09-04.** Two independently operated nodes — different machines,
+different operators — produced byte-identical rows at pruning point
+`f1caa6c3dacd1a79b38bfddeb9df773ce22da44bead7db34e249b731d2804b73`: 47,496,442 UTXOs, digest
+`323d9496d062fc42582f8a7208879ae05bdc65ba1c4d4dfb51115da7613d4985`, parameters `(1024, 16)` and
+outcome `OK` on both sides.
+
+Two properties make this worth more than a digest match alone. The recorded digest is the
+*from-scratch rebuild*, so what agreed was two independent rebuilds over two UTXO sets that
+MuHash had each separately verified against the header commitment — the UTXO count matching is
+itself evidence the inputs were identical. And the two nodes arrived by different histories: one
+backfilled two days earlier then maintained incrementally through four pruning transitions and a
+restart, the other backfilled about six hours before the match.
+
+**What it is not.** One shared pruning point. Agreement between instances of a *single
+implementation*, so a systematic error would agree with itself — the frozen vectors and the
+44.7M-UTXO replay remain the only external anchor for the encoding. Both nodes seeded by the
+same mechanism (the startup backfill), so a node seeded by genesis accumulation or by IBD
+pruning-point import would add a genuinely different route. And the comparison was made by hand
+from the JSONL records: a cooperative-operator channel, not a trust-minimized one. A served row
+says what a node's history *file* claims, not what the node computed.
+
+**Anchoring rows to pruning points is what makes this work at all.** The pruning point is
+committed in block headers and consensus-validated, so two nodes cannot disagree about *which*
+block it is without a consensus split — the join key is trustworthy. But nodes do not all record
+the same *set* of them: `advance_pruning_point_if_possible` takes `next_pruning_points(...).last()`
+and checks only that one, so a node whose sink jumps forward past several pruning samples skips
+the intermediate points entirely, and those rows can never be recovered once the shadow entries
+are pruned. Histories are therefore sparse in a structured way — every row comparable, coverage
+depending on how continuously each node's sink advanced.
 
 ---
 

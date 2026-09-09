@@ -42,6 +42,26 @@ impl UmcCascadeKey {
         bytes[66..98].copy_from_slice(current_chain_block.as_ref());
         Self { conflict_genesis, k, next_chain_ancestor, current_chain_block, bytes }
     }
+
+    pub const SERIALIZED_LEN: usize = kaspa_hashes::HASH_SIZE * 3 + 2;
+
+    /// Parses a logical key produced by [`Self::new`]. `bytes` excludes the store prefix.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        if bytes.len() != Self::SERIALIZED_LEN {
+            return Err(StoreError::DataInconsistency(format!(
+                "UmcCascadeKey expects {} bytes, got {}",
+                Self::SERIALIZED_LEN,
+                bytes.len()
+            )));
+        }
+        let hs = kaspa_hashes::HASH_SIZE;
+        Ok(Self::new(
+            Hash::from_slice(&bytes[..hs]),
+            KType::from_be_bytes([bytes[hs], bytes[hs + 1]]),
+            Hash::from_slice(&bytes[(hs + 2)..(2 * hs + 2)]),
+            Hash::from_slice(&bytes[(2 * hs + 2)..(3 * hs + 2)]),
+        ))
+    }
 }
 
 impl std::fmt::Display for UmcCascadeKey {
@@ -199,7 +219,8 @@ impl UmcCascadeStore for DbUmcCascadeStore {
         let (start, end) = rocksdb::PrefixRange(prefix.as_slice()).into_bounds();
         // Neither bound can be absent: the leading store-prefix byte is 81, not 0xFF.
         let (start, end) = (start.expect("prefix is non-empty"), end.expect("prefix is not all-0xFF"));
-        let mut count = 0u32;
+        let prefix_len = DatabaseStorePrefixes::DagKnightUMC.as_ref().len();
+        let mut keys = Vec::new();
         let mut iter = self.db.raw_iterator();
         iter.seek(&start);
         while iter.valid() {
@@ -210,10 +231,16 @@ impl UmcCascadeStore for DbUmcCascadeStore {
             if key >= end.as_slice() {
                 break;
             }
-            count += 1;
+            keys.push(UmcCascadeKey::from_bytes(&key[prefix_len..])?);
             iter.next();
         }
-        batch.delete_range(start, end);
+        // A scan cut short by an iterator error would delete only part of the range.
+        iter.status()?;
+
+        let count = keys.len() as u32;
+        if count > 0 {
+            self.access.delete_many(BatchDbWriter::new(batch), &mut keys.into_iter())?;
+        }
         Ok(count)
     }
 }
@@ -328,5 +355,43 @@ mod tests {
         assert_eq!(deleted, 1, "only the targeted conflict genesis may be counted");
         assert_eq!(raw_row_count(&db, lower_cg), 0);
         assert_eq!(raw_row_count(&db, upper_cg), 1, "the next conflict genesis in key order must survive");
+    }
+
+    #[test]
+    fn test_db_prune_by_conflict_genesis_invalidates_cache() {
+        let (_lifetime, db) = kaspa_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbUmcCascadeStore::new(db.clone(), CachePolicy::Count(64));
+
+        let pruned_cg = Hash::from_u64_word(1);
+
+        let pruned_keys = [key(1, 1, 2, 3), key(1, 2, 2, 4)];
+        let kept_key = key(2, 1, 3, 5);
+
+        for k in pruned_keys.iter() {
+            store.insert_checkpoint(k.clone(), state(1)).unwrap();
+        }
+        store.insert_checkpoint(kept_key.clone(), state(2)).unwrap();
+
+        for k in pruned_keys.iter() {
+            assert!(store.get_checkpoint(k.clone()).unwrap().is_some());
+        }
+
+        let mut batch = WriteBatch::default();
+        let deleted = store.prune_by_conflict_genesis(&mut batch, pruned_cg).unwrap();
+        db.write(batch).unwrap();
+
+        assert_eq!(deleted, pruned_keys.len() as u32);
+        for k in pruned_keys.iter() {
+            assert!(store.get_checkpoint(k.clone()).unwrap().is_none(), "pruned checkpoint must not be served from cache");
+        }
+        assert!(store.get_checkpoint(kept_key).unwrap().is_some(), "another conflict genesis must be preserved");
+    }
+
+    #[test]
+    fn test_umc_cascade_key_from_bytes_roundtrip() {
+        let k = key(1, 0x0101, 2, 3);
+        let parsed = UmcCascadeKey::from_bytes(k.as_ref()).unwrap();
+        assert_eq!(k, parsed);
+        assert!(UmcCascadeKey::from_bytes(&k.as_ref()[..UmcCascadeKey::SERIALIZED_LEN - 1]).is_err());
     }
 }

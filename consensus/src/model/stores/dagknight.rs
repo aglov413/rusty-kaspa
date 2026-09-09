@@ -50,6 +50,31 @@ impl DagknightKey {
 
         Self { pov_hash, root_hash, k, free_search, bytes }
     }
+
+    pub const SERIALIZED_LEN: usize = kaspa_hashes::HASH_SIZE * 2 + 3;
+
+    /// Parses a logical key produced by [`Self::new`]. `bytes` excludes the store prefix.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        if bytes.len() != Self::SERIALIZED_LEN {
+            return Err(StoreError::DataInconsistency(format!(
+                "DagknightKey expects {} bytes, got {}",
+                Self::SERIALIZED_LEN,
+                bytes.len()
+            )));
+        }
+        let hash_size = kaspa_hashes::HASH_SIZE;
+        let root_hash = Hash::from_slice(&bytes[..hash_size]);
+        let k = KType::from_be_bytes([bytes[hash_size], bytes[hash_size + 1]]);
+        let pov_hash = Hash::from_slice(&bytes[(hash_size + 2)..(2 * hash_size + 2)]);
+        let free_search = match bytes[2 * hash_size + 2] {
+            0 => false,
+            1 => true,
+            other => {
+                return Err(StoreError::DataInconsistency(format!("DagknightKey free_search flag must be 0 or 1, got {other}")));
+            }
+        };
+        Ok(Self::new(root_hash, pov_hash, k, free_search))
+    }
 }
 
 impl fmt::Display for DagknightKey {
@@ -216,20 +241,26 @@ impl DagknightStore for DbDagknightStore {
             bytes.push(0xFF); // k = 0xFFFF u16 second byte
             bytes
         };
-        // TODO[DK]: count keys in range. Possibly would be removed.
-        let mut count = 0;
+        let prefix_len = DatabaseStorePrefixes::DagKnight.as_ref().len();
+        let mut keys = Vec::new();
         let mut iterator = self.db.raw_iterator();
         iterator.seek(&start_conflict_genesis_bytes);
         while iterator.valid() {
             let key = iterator.key();
-            if key.unwrap() >= end_conflict_genesis_bytes.as_slice() {
+            let raw_key = key.unwrap();
+            if raw_key >= end_conflict_genesis_bytes.as_slice() {
                 break;
             }
-            count += 1;
+            keys.push(DagknightKey::from_bytes(&raw_key[prefix_len..])?);
             iterator.next();
         }
-        // Perform the range delete
-        batch.delete_range(start_conflict_genesis_bytes, end_conflict_genesis_bytes);
+        // A scan cut short by an iterator error would delete only part of the range.
+        iterator.status()?;
+
+        let count = keys.len() as u32;
+        if count > 0 {
+            self.access.delete_many(BatchDbWriter::new(batch), &mut keys.into_iter())?;
+        }
         Ok(count)
     }
 }
@@ -337,5 +368,109 @@ mod tests {
 
         assert_eq!(read1.blue_score, 10);
         assert_eq!(read2.blue_score, 20);
+    }
+
+    #[test]
+    fn test_delete_rooted_range_invalidates_cache() {
+        use crate::model::stores::ghostdag::GhostdagData;
+        use kaspa_database::prelude::{CachePolicy, ConnBuilder};
+        use kaspa_hashes::Hash;
+        use std::sync::Arc;
+
+        let (_lifetime, db) = kaspa_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbDagknightStore::new(db.clone(), CachePolicy::Count(64));
+
+        let pruned_root: Hash = 0xAA_u64.into();
+        let kept_root: Hash = 0xCC_u64.into();
+        let pov: Hash = 0xBB_u64.into();
+
+        let gd = || {
+            Arc::new(GhostdagData::new(
+                10,
+                Default::default(),
+                Hash::from_u64_word(1),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ))
+        };
+
+        // The range bounds exclude `k = KType::MAX` by design; see the TODO[DK] above.
+        let pruned_keys = [
+            DagknightKey::new(pruned_root, pov, 1, false),
+            DagknightKey::new(pruned_root, pov, 1, true),
+            DagknightKey::new(pruned_root, pov, 0x0101, false),
+        ];
+        let kept_key = DagknightKey::new(kept_root, pov, 1, false);
+
+        for key in pruned_keys.iter() {
+            store.insert(key.clone(), gd()).expect("insert");
+        }
+        store.insert(kept_key.clone(), gd()).expect("insert kept");
+
+        for key in pruned_keys.iter() {
+            assert!(store.has(key.clone()).unwrap());
+        }
+
+        let mut batch = WriteBatch::default();
+        let deleted = store.delete_rooted_range(&mut batch, pruned_root).unwrap();
+        db.write(batch).unwrap();
+
+        assert_eq!(deleted, pruned_keys.len() as u32);
+        for key in pruned_keys.iter() {
+            assert!(!store.has(key.clone()).unwrap(), "pruned key must not be reported as present");
+            assert!(store.get_data(key.clone()).is_err(), "pruned key must not return stale data");
+        }
+        assert!(store.has(kept_key.clone()).unwrap(), "entries rooted at another block must be preserved");
+        assert!(store.get_data(kept_key).is_ok());
+    }
+
+    /// Neighbouring roots must be untouched.
+    #[test]
+    fn test_delete_rooted_range_empty_is_noop() {
+        use crate::model::stores::ghostdag::GhostdagData;
+        use kaspa_database::prelude::{CachePolicy, ConnBuilder};
+        use kaspa_hashes::Hash;
+        use std::sync::Arc;
+
+        let (_lifetime, db) = kaspa_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbDagknightStore::new(db.clone(), CachePolicy::Count(64));
+
+        let key = DagknightKey::new(0xAA_u64.into(), 0xBB_u64.into(), 1, false);
+        store
+            .insert(
+                key.clone(),
+                Arc::new(GhostdagData::new(
+                    10,
+                    Default::default(),
+                    Hash::from_u64_word(1),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )),
+            )
+            .unwrap();
+
+        let mut batch = WriteBatch::default();
+        let deleted = store.delete_rooted_range(&mut batch, 0xDD_u64.into()).unwrap();
+        db.write(batch).unwrap();
+
+        assert_eq!(deleted, 0);
+        assert!(store.has(key).unwrap());
+    }
+
+    #[test]
+    fn test_dagknight_key_from_bytes_roundtrip() {
+        let key = DagknightKey::new(0xAA_u64.into(), 0xBB_u64.into(), 0x0101, true);
+        let parsed = DagknightKey::from_bytes(key.as_ref()).unwrap();
+        assert!(key == parsed);
+        assert_eq!(key.as_ref(), parsed.as_ref());
+        assert_eq!(parsed.k, 0x0101);
+        assert!(parsed.free_search);
+
+        assert!(DagknightKey::from_bytes(&key.as_ref()[..DagknightKey::SERIALIZED_LEN - 1]).is_err());
+        let mut bad = key.as_ref().to_vec();
+        *bad.last_mut().unwrap() = 2;
+        assert!(DagknightKey::from_bytes(&bad).is_err(), "unknown free_search flag must be rejected");
     }
 }

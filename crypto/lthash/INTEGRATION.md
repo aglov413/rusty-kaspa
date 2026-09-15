@@ -162,7 +162,7 @@ fault.
 
 | | effect |
 |---|---|
-| CPU, per UTXO operation | **1.77 µs benched / 2.45 µs measured on a live node**, against MuHash's 2.68 µs — LtHash is *cheaper* per element |
+| CPU, per UTXO operation | **1.73 µs benched / 2.26 µs measured on a live node**, against MuHash's 2.52 µs — LtHash is *cheaper* per element |
 | Storage | +2048 bytes per retained chain block; **+1.8 GB at devnet's 10 bps** (pruning depth 1,080,000), ~+180 MB at 1 bps |
 | Pruning-point import | **111.9 s measured** over 45.6M UTXOs, one-off |
 | Drift check | ~112 s over 45.6M UTXOs, once per pruning-point move |
@@ -182,7 +182,7 @@ a statement about mainnet viability.
 1. **Phase 1 — plumbing.** *(done)* Every change landed, additive, shadow disabled by default.
 2. **Phase 2 — enable on devnet.** *(done, partially)* Synced from scratch with
    `--shadow-lthash`. The drift check has passed at **every pruning point transition observed**,
-   under both expansions, with zero errors; the complete per-transition record is kept in
+   under all three expansions this crate has used, with zero errors; the complete per-transition record is kept in
    `shadow-lthash-history.jsonl` beside the database. **How many reorgs this covers is unknown,
    because nothing logs a reorg** — no run can report a count in either direction. See §8.
 3. **Phase 3 — report.** *(done for what Phase 2 covered)* Results are in
@@ -251,11 +251,28 @@ own hard fork to introduce, before the fork that switches over.
 property with no header change, no mining impact and no fork, during the shadow phase rather
 than requiring a preliminary one.
 
-**First cross-node match, 2026-09-04.** Two independently operated nodes — different machines,
-different operators — produced byte-identical rows at pruning point
+**First cross-node match, 2026-09-04 — under the superseded expansion.** Two independently
+operated nodes — different machines, different operators — produced byte-identical rows at
+pruning point
 `f1caa6c3dacd1a79b38bfddeb9df773ce22da44bead7db34e249b731d2804b73`: 47,496,442 UTXOs, digest
 `323d9496d062fc42582f8a7208879ae05bdc65ba1c4d4dfb51115da7613d4985`, parameters `(1024, 16)` and
 outcome `OK` on both sides.
+
+**This result does not carry over to the current expansion.** It was produced under
+`Blake2b-256 -> ChaCha20`; the crate now uses `Blake2b-512 -> 2x ChaCha20` (`b2c2`), and values
+from the two constructions are numerically unrelated. Cross-node agreement has to be
+re-established, and both operators must be on the same construction before their rows can be
+compared at all — which is what the `construction` field in each history row exists to make
+impossible to get wrong. Until then, this stands as evidence that the *method* works, not as a
+live result.
+
+**Changing expansion requires purging the shadow store.** The node rebuilds its shadow only
+when it is *absent* at the sink, so a restart against an existing database silently folds
+new-construction values into old-construction state. `kaspad/examples/purge_shadow_lthash.rs`
+clears the store in place (dry run by default, `--commit` to apply) so an operator does not
+have to `--reset-db` and resync for what is a research-only store. Run it with the node
+stopped; it refuses to open a locked database. This applies to every operator on every
+expansion change, not just this one.
 
 Two properties make this worth more than a digest match alone. The recorded digest is the
 *from-scratch rebuild*, so what agreed was two independent rebuilds over two UTXO sets that

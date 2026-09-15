@@ -13,8 +13,10 @@
 //! `(Z_{2^W})^N` -- `N` lanes of `W` bits, added lane-wise with wrapping arithmetic.
 //!
 //! * An element is expanded by a random oracle `H : {0,1}* -> (Z_{2^W})^N`, instantiated as
-//!   `Blake2b-256 -> ChaCha20` — the same shape MuHash uses (see [`expand`] for the
-//!   construction, and for why the resulting ~2^128 binding cap is accepted knowingly).
+//!   `Blake2b-512 -> 2x ChaCha20`: the 512-bit digest is split across two ChaCha20 keys, each
+//!   filling half the state, so generic collision search on the seed costs ~2^256 rather than
+//!   the ~2^128 a single 256-bit seed would allow. See [`expand`] for the construction, and
+//!   `PARAMETER-REVIEW.md` Q3 for the review this has not yet had.
 //! * `add(x)` adds `H(x)` lane-wise; `remove(x)` subtracts it lane-wise.
 //! * The identity (empty multiset) is the all-zero state.
 //! * The union of two multisets is the lane-wise sum of their states.
@@ -39,9 +41,11 @@
 //! the exact bytes that `consensus/core/src/muhash.rs::write_utxo` emits. Both accumulators
 //! hash byte-identical elements, so their outputs are directly comparable.
 //!
-//! **Not shared:** the domain separators, and obviously the algebra. The *expansion* is
-//! deliberately the same shape MuHash uses, which keeps a future migration minimal — only the
-//! group the accumulator lives in would change. See [`expand`].
+//! **Not shared:** the domain separators, the algebra, and — since the expansion changed — the
+//! seed width and the ChaCha20 implementation. MuHash keys one `rand_chacha` instance from a
+//! 256-bit Blake2b seed; this crate keys two RustCrypto `chacha20` (RFC 8439) instances from
+//! the halves of a 512-bit one. What a migration leaves untouched is the *element encoding*,
+//! which is the part that determines what bytes get hashed. See [`expand`].
 //!
 //! ## Example
 //!
@@ -293,13 +297,10 @@ impl LtHash {
     /// value destined for a header field and every other Kaspa header hash is Blake2b-256 —
     /// including MuHash's own `MuHashFinalizeHash`. A XOF buys nothing at fixed width.
     ///
-    /// The width does bound *untargeted* collision search at `~2^128`. It does not bound the
-    /// attack the commitment actually defends against: poisoning an already-published pruning
-    /// point is a second-preimage problem, and Blake2b-256 second-preimage resistance is
-    /// `~2^256`. That is why the element expansion, not the digest, was the binding
-    /// constraint worth fixing — see [`crate::expand`].
+    /// Whether 32 bytes is the right width is a security question, not an implementation one,
+    /// and it is asked rather than answered: `PARAMETER-REVIEW.md` **Q7**.
     pub fn digest(&self) -> [u8; DIGEST_SIZE] {
-        expand::blake2b_256(&expand::finalize_domain(&self.params), &self.serialize())
+        expand::blake2b_256(expand::finalize_domain(&self.params).as_bytes(), &self.serialize())
     }
 
     /// The digest as lowercase hex, for logs and test failure messages.

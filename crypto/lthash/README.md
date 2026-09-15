@@ -51,7 +51,7 @@ companion documents, and is deliberately *not* repeated here.
 
 | Document | Owns |
 |---|---|
-| `PARAMETER-REVIEW.md` | The request for cryptographic review. The construction in full (§2), why `(1024, 16)` (§1, §3), the ~2^128 binding cap and why it was accepted (§5.1), Wagner (§5.2), the UTXO element layout and adversarial freedom per field (§6.1), and the open questions (§7). |
+| `PARAMETER-REVIEW.md` | The request for cryptographic review. The construction in full (§2), why `(1024, 16)` (§1, §3), the seed funnel, why the ~2^128 cap was closed and what that leaves open (§5.1), Wagner (§5.2), the UTXO element layout and adversarial freedom per field (§6.1), and the open questions (§7). |
 | `INTEGRATION.md` | How the shadow is wired into consensus: safety invariants (§2), the one-source encoding rule (§3), change sites (§4), what the shadow validates (§5), rollout (§7), known risks (§8), and the cross-node gap (§8b). |
 | `MUHASH-SURVEY.md` | How MuHash behaves in this codebase today — notably §4c, the reorg/backout path the shadow had to match. |
 
@@ -90,6 +90,7 @@ lane-wise with wrapping arithmetic.
 | Default `W` (lane bits) | 16 |
 | Default state size | 2048 bytes |
 | Digest size | 32 bytes (Blake2b-256) |
+| Expansion funnel | 512 bits (Blake2b-512, split across two ChaCha20 keys) |
 | Identity (empty multiset) | all lanes zero |
 | `add(x)` | lane-wise wrapping **add** of `H(x)` |
 | `remove(x)` | lane-wise wrapping **sub** of `H(x)` |
@@ -103,20 +104,42 @@ including widths that are not a multiple of 8.
 ### Element expansion, in brief
 
 ```text
-seed(x)  = Blake2b-256(key = "LtHashElement:n=<N>,w=<W>", message = x)   -> 256 bits
-lanes(x) = canonical_unpack( ChaCha20(key = seed(x), nonce = 0, counter = 0) )
+s(x)     = Blake2b-512(key = "LtHashElement:b2c2:n=<N>,w=<W>", message = x)  -> 64 bytes
+lanes(x) = canonical_unpack(
+    ChaCha20(key = s(x)[0..32],  nonce = "LtHashLane\x00\x00") -> bytes 0..1024
+ || ChaCha20(key = s(x)[32..64], nonce = "LtHashLane\x00\x01") -> bytes 1024..2048 )
 ```
 
-This deliberately **mirrors MuHash's own expansion** (`crypto/muhash/src/lib.rs`), which is in
-turn the shape Bitcoin Core's MuHash3072 uses — so a migration changes only the group the
-accumulator lives in, adds no new primitives, and keeps any divergence attributable to the
-algebra rather than the expansion.
+Offsets are bytes. The keystream ranges are the shipping parameters (`N = 1024`, `W = 16`,
+so the state is 2048 bytes and each instance fills exactly 1024). In general the split is
+`floor(L/2)` where `L = ceil(N*W/8)`; for odd `L` the right instance takes the extra byte.
 
-`H` factors through a 256-bit intermediate, which **caps binding at ~2^128 regardless of
-`N*W`**. That is a deliberate, documented acceptance, not an oversight, and an earlier
-cSHAKE256 revision (~2^256, ~4x the cost) was reverted to get here. The full argument, the
-Solana precedent, and the counter-arguments are `PARAMETER-REVIEW.md` §5.1 — and whether the
-trade is right is its **Q3**, which is not settled.
+ChaCha20 here is the IETF construction (RFC 8439) from the `chacha20` crate. The `b2c2` tag in
+the domain names the construction and is bumped whenever the expansion changes, so values from
+different constructions are never silently compared.
+
+This **follows the shape of MuHash's own expansion** (`crypto/muhash/src/lib.rs`), itself the
+shape Bitcoin Core's MuHash3072 uses, and departs from it in two deliberate places: Blake2b-512
+split across two ChaCha20 instances rather than -256 into one, and RustCrypto's `chacha20`
+rather than `rand_chacha`. The element *encoding* remains byte-identical to MuHash's, so a
+divergence between the two accumulators is still attributable to the algebra.
+
+**Why two instances.** ChaCha20's key is exactly 256 bits, so a single instance carries at most
+256 bits of digest into the keystream — which bounded generic **collision** search on the seed
+at `~2^128` regardless of `N*W`. Splitting the digest and **concatenating** the keystreams
+(never XOR: XOR would let collisions cancel) makes all 512 bits load-bearing: an output
+collision requires both halves to collide, implying a full Blake2b-512 collision at `~2^256`.
+
+**Collision, not second preimage.** The attacker picks *both* members offline, publishes one as
+an ordinary UTXO, and substitutes the other later; the homomorphism means the rest of the set
+is irrelevant, so only one element has to be theirs. Finding a second preimage for a UTXO
+someone *else* published costs `~2^256` even against the old seed. The two differ by a square,
+so the labels are worth keeping straight.
+
+**This construction is our own and has no published analysis.** It costs ~0% against the capped
+version it replaced, which is why it was taken — but whether it is sound is
+`PARAMETER-REVIEW.md` **Q3**, and it is not settled. The standards-backed fallbacks, measured,
+are cSHAKE256 (FIPS 202, 6.93 µs) and TurboSHAKE256 (CFRG draft, 3.42 µs) against ~1.11 µs.
 
 ### Digest
 
@@ -153,7 +176,8 @@ Two things worth knowing before reading any number below:
   birthday attack is what constrains `(N, W)`; choosing LtHash buys no margin against it
   whatsoever. The post-quantum motivation concerns Shor against MuHash's group, and is a
   separate axis. `PARAMETER-REVIEW.md` §5.2.
-* **Binding is capped at ~2^128** by the 256-bit expansion intermediate, knowingly. §5.1.
+* **Binding is ~2^256**, since the expansion carries a full 512-bit funnel. An earlier
+  revision capped it at ~2^128; that is closed. §5.1.
 
 The parameter sweep that informed the choice is under "Parameter sweep" below; the reasoning
 and the open questions are §1, §3, §5 and §7 of the review packet.
@@ -192,13 +216,13 @@ Reproduce with `cargo bench -p kaspa-muhash` from the repo root and `cargo bench
 
 | Operation | MuHash | LtHash | |
 |---|---:|---:|---|
-| `add_element` (100 B input) | 2.68 µs | **1.770 µs** | **1.51x faster** |
-| `remove_element` | 2.70 µs | **1.875 µs** | **1.44x faster** |
-| `combine` / `union_in_place` | 4.41 µs | **0.172 µs** | **26x faster** |
-| `serialize` (populated accumulator) | 25.69 µs | **0.384 µs** | **67x faster** |
-| `finalize` / `digest` | 26.24 µs | **2.089 µs** | **13x faster** |
-| `add_utxo` (97 B encoding) | — | 1.811 µs | encoding adds ~0.04 µs |
-| `clone` | **17.8 ns** | 94.0 ns | 5.3x slower — see note |
+| `add_element` (100 B input) | 2.608 µs | **1.726 µs** | **1.51x faster** |
+| `remove_element` | 2.642 µs | **1.764 µs** | **1.50x faster** |
+| `combine` / `union_in_place` | 4.445 µs | **0.180 µs** | **24.6x faster** |
+| `serialize` (populated accumulator) | 24.88 µs | **0.402 µs** | **62x faster** |
+| `finalize` / `digest` | 25.33 µs | **2.063 µs** | **12.3x faster** |
+| `add_utxo` (97 B encoding) | — | 1.734 µs | encoding adds ~0.01 µs |
+| `clone` | **24.8 ns** | 104.1 ns | 4.2x slower — see note |
 | resumable state size | **384 B** | 2048 B | 5.3x larger |
 
 **LtHash is faster than MuHash on every operation except `clone`**, which costs 94 ns.
@@ -206,7 +230,7 @@ Reproduce with `cargo bench -p kaspa-muhash` from the repo root and `cargo bench
 `clone` is a plain memory copy of the accumulator state. In RAM, LtHash holds
 `Vec<u64>` × 1024 = **8192 bytes** — each 16-bit lane occupies a full `u64`, so that `W` can
 be any width up to 64 without changing the representation — against MuHash's two `U3072` =
-768 bytes. So `clone` copies 10.7x more memory and is only 5.3x slower, memcpy overhead
+768 bytes. So `clone` copies 10.7x more memory and is only 4.2x slower, memcpy overhead
 amortising over the larger block. (The *serialized* sizes are 2048 and 384 bytes; those are
 what the store holds.)
 
@@ -215,41 +239,53 @@ pruning-point import, never per element or per transaction. The number worth tra
 clone latency but the **8 KB resident footprint per live accumulator** — parallel transaction
 validation holds one per rayon task, so a few tens of KB transiently.
 
-MuHash's `serialize`/`finalize` cost is data-dependent — 189 ns on a fresh accumulator,
-25.7 µs on one with a populated denominator, because `normalize()` performs a 3072-bit modular
-division. The populated case is the one that occurs in the node; that is where the 67x comes
+MuHash's `serialize`/`finalize` cost is data-dependent — 184 ns on a fresh accumulator,
+24.9 µs on one with a populated denominator, because `normalize()` performs a 3072-bit modular
+division. The populated case is the one that occurs in the node; that is where the 62x comes
 from.
 
-*Measured on an otherwise idle machine. Two internal consistency checks pass: `add_element`
-(1.770 µs) agrees within 3% with the `n=1024, w=16` sweep entry (1.825 µs), and the unpack
-regression guard agrees within 2% with its reference.*
+*Measured on an otherwise idle machine, all in one session. Two internal consistency checks
+pass: `add_element` (1.726 µs) agrees within 0.2% with the `n=1024, w=16` entry of the
+parameter sweep (1.723 µs), and the unpack regression guard stays in the same band as its
+`chunks_exact` reference — the crate's path is currently 11% faster.*
 
 ### Where the per-element cost goes
 
-| Component | Cost |
-|---|---:|
-| Blake2b-256 seed + ChaCha20 setup | ~0.40 µs |
-| ChaCha20 keystream, 2048 B (~1.7 GB/s) | 1.219 µs |
-| Unpack keystream into 1024 lanes | 0.420 µs |
-| Lane-wise wrapping add | ~0.13 µs |
-| **total** | **~1.77 µs** |
+| Component | Cost | |
+|---|---:|---|
+| Blake2b-512 seed (one keyed hash, 64-byte output) | 0.281 µs | measured |
+| Two ChaCha20 instances, 1024 B each | 0.850 µs | keystream − seed |
+| Unpack keystream into 1024 lanes | 0.414 µs | expand − keystream |
+| Lane-wise wrapping add | 0.181 µs | add_element − expand |
+| **total** | **1.726 µs** | measured |
 
-Roughly two thirds is keystream. An early revision spent 79% of `add_element` in the *unpack*
-instead, doing a runtime-length `copy_from_slice` per lane; specialising `packing.rs` on the
-lane width cut that 12.7x. The bench keeps a `chunks_exact` reference beside the crate's path
-as a regression guard — they now measure 420 ns and 413 ns respectively.
+Expansion is **66%** of the per-element cost (seed plus keystream); the keystream alone is
+49%. An early revision spent 79% of `add_element` in the *unpack* instead, doing a
+runtime-length `copy_from_slice` per lane; specialising `packing.rs` on the lane width cut
+that 12.7x. The bench keeps a `chunks_exact` reference beside the crate's path as a
+regression guard — they measure 451 ns and 505 ns respectively, so the crate's specialised
+path is now the faster of the two.
 
 ### Alternatives considered
 
-Every expansion that removes the ~2^128 cap costs materially more, and every *faster* one has
-the same cap — structural, since 256-bit collision resistance needs a >= 512-bit internal state
-to survive the birthday bound. The measured comparison of all five candidates (`Blake2b-256 ->
-ChaCha20`, BLAKE3 XOF, Blake2b-512 counter mode, cSHAKE256, SHAKE128/AES-CTR) is the table in
-`PARAMETER-REVIEW.md` §5.1.
+An earlier revision of this file argued that every expansion removing the ~2^128 cap costs
+materially more. That was true of every *XOF* we measured, and it is why the cap was tolerated
+for a while — but it is not true in general. Widening the funnel without changing primitives
+costs ~0%, which is what the shipping construction does.
 
-Worth noting BLAKE3 measured *slower* than ChaCha20 here — its SIMD advantage needs inputs
-larger than 2 KB. Choosing ChaCha20 over BLAKE3 costs nothing in security (identical cap) and
-avoids a dependency; the Solana precedent is about the security *level*, not the primitive.
+The measured comparison of all seven candidates — the shipping construction, the capped one it
+replaced, a 320-bit variant, BLAKE3 XOF, BLAKE2Xb (serial and SIMD), TurboSHAKE256 and
+cSHAKE256 — is the table in `PARAMETER-REVIEW.md` §5.1. Two results from it are worth
+repeating here:
+
+* **Every standardised ~2^256 option makes LtHash slower than MuHash.** cSHAKE256 and
+  TurboSHAKE256 both invert the comparison this whole proposal rests on. The shipping
+  construction is the only ~2^256 candidate that does not — and it is also the one with no
+  published analysis behind it. That tension is `PARAMETER-REVIEW.md` Q3.
+* **BLAKE3 measured *slower* than ChaCha20 here** — its SIMD advantage needs inputs larger
+  than 2 KB — and carries the same ~2^128 cap structurally, since its chaining value is
+  256 bits. So it was never a candidate for removing the cap; the Solana precedent it comes
+  from is about the security *level*, not the primitive.
 
 ### Illustrative block-level cost
 
@@ -258,8 +294,8 @@ calls from the per-transaction rayon reduce, one finalize:
 
 | | element ops | combines | finalize | total |
 |---|---:|---:|---:|---:|
-| MuHash | 2144 µs | 882 µs | 26 µs | **3052 µs** |
-| LtHash | 1416 µs | 34 µs | 2 µs | **1452 µs** (2.1x faster) |
+| MuHash | 2086 µs | 889 µs | 25 µs | **3000 µs** |
+| LtHash | 1381 µs | 36 µs | 2 µs | **1419 µs** (2.1x faster) |
 
 The `combine` column matters independently: MuHash's combine is two 3072-bit modular
 multiplications and costs *more* than an add, so the per-transaction reduce is a real expense
@@ -274,8 +310,8 @@ inputs, single-threaded). For a typical 2-input / 2-output transaction:
 | Work | Cost |
 |---|---:|
 | Script + signature verification (2 inputs) | 71.8 µs |
-| MuHash multiset (4 element ops @ 2.68 µs) | 10.7 µs |
-| **LtHash multiset (4 element ops @ 1.770 µs)** | **7.1 µs** |
+| MuHash multiset (4 element ops @ 2.607 µs) | 10.4 µs |
+| **LtHash multiset (4 element ops @ 1.726 µs)** | **6.9 µs** |
 
 | Configuration | Relative validation cost |
 |---|---:|
@@ -404,7 +440,7 @@ choice of the script field. Mainnet would be the place to check.
 The 44.7M-UTXO replay ran three accumulators in one pass (MuHash twice, LtHash once) in
 635.8 s = 14.24 µs/UTXO. That run predates the expansion change and used cSHAKE256, so it
 corroborates the *encoding* and the *method*, not the current per-element cost. The
-superseding measurement is under "Live devnet results" below: **2.45 µs/UTXO** for the current
+superseding measurement is under "Live devnet results" below: **2.26 µs/UTXO** for the current
 expansion, measured in-node over 45.6M UTXOs.
 
 For the IBD path — where a syncing node accumulates the whole pruning-point UTXO set before
@@ -427,9 +463,9 @@ count**, differing only in the expansion:
 | Expansion | Elapsed | Per UTXO |
 |---|---:|---:|
 | cSHAKE256 | 406.3 s | 8.94 µs |
-| **`Blake2b-256 -> ChaCha20`** | **111.9 s** | **2.45 µs** |
+| `Blake2b-256 -> ChaCha20` (superseded) | 111.9 s | 2.45 µs |
 
-Same 45,609,558 UTXOs, same machine, **3.6x faster**. Real-node cost exceeds the 1.77 µs
+Same 45,609,558 UTXOs, same machine, **3.6x faster**. Real-node cost exceeds the 1.73 µs
 benchmark by ~0.68 µs, which is RocksDB iteration, entry deserialization and allocation.
 
 For the IBD path specifically — where a syncing node accumulates the whole pruning-point UTXO
@@ -440,9 +476,14 @@ than +406 s.
 
 The drift check rebuilds LtHash from scratch over the pruning-point UTXO set and compares it
 against the value maintained incrementally. It has passed at **every pruning point transition
-observed**. The runs below are the ones timed by hand; from 2026-09-03 every transition is
-recorded automatically in `shadow-lthash-history.jsonl` beside the database, which is the
-complete record:
+observed**, across all three expansions the crate has used. The runs below are the ones timed
+by hand; from 2026-09-03 every transition is recorded automatically in
+`shadow-lthash-history.jsonl` beside the database, which is the complete record.
+
+**Rows in that file are only comparable within one expansion.** Each carries a `construction`
+field for exactly that reason; rows written before 2026-09-14 predate the field, and the
+purge timestamp in the log is the boundary. Timings below are likewise not comparable across
+rows with different expansions.
 
 | Run | Expansion | Pruning point | UTXOs | Rebuild | Result |
 |---|---|---|---:|---:|---|
@@ -451,6 +492,22 @@ complete record:
 | 3 | `Blake2b-256 -> ChaCha20` | `19f30664…` | 45,985,164 | 115.1 s | **match** |
 | 4 | `Blake2b-256 -> ChaCha20` | `be39bfa0…` | 46,111,403 | 115.4 s | **match** |
 | 5 | `Blake2b-256 -> ChaCha20` | `1785436d…` | 46,271,026 | 118.1 s | **match** |
+| 6 | `B2b-512 -> 2x ChaCha20` | `376c8046…` | 51,049,524 | 115.5 s | **match** |
+| 7 | `B2b-512 -> 2x ChaCha20` | `79a8c951…` | 51,164,789 | 116.0 s | **match** |
+| 8 | `B2b-512 -> 2x ChaCha20` | `d8fd3388…` | 51,277,801 | 120.5 s | **match** |
+
+Runs 2–5 used `Blake2b-256 -> ChaCha20`, the ~2^128-capped expansion superseded on 2026-09-14.
+Twenty-five consecutive transitions passed under it before the change. Runs 6–8 are the first
+three under the current expansion, at 51.0–51.3M UTXOs, all matching — and rebuilding at
+115–121 s against the 112–118 s the capped construction posted over 45–46M-element sets, i.e.
+comparable per-element throughput over a set roughly 11% larger.
+
+The shadow store was purged at the changeover, since values from the two constructions are not
+comparable and `backfill_shadow_if_needed` only rebuilds when the shadow is *absent* — see
+`kaspad/examples/purge_shadow_lthash.rs`. **Run 6 predates the `construction` field**, so its
+row in `shadow-lthash-history.jsonl` carries `b2c2` values with no tag; every row from run 7
+onward is labelled. Rows before the purge are the old expansion and are not comparable with
+anything after it.
 
 ```
 [SHADOW-LTHASH] OK -- the incremental shadow matches a from-scratch rebuild over 45471168
@@ -512,7 +569,7 @@ drift check — see the note above on what the drift check can and cannot catch.
 ## Testing
 
 ```bash
-cargo test -p kaspa-lthash              # 41 tests, ~5s
+cargo test -p kaspa-lthash              # 48 tests, ~5s
 cargo test -p kaspa-consensus-core --lib muhash   # 3 encoding-parity tests
 cargo clippy --all-targets
 ```
@@ -544,8 +601,8 @@ would be nothing to compare; the differential tests the accumulator logic, not t
 expansion.
 
 The 1e5-element tests would be unusably slow in a pure debug build, so the root manifest
-carries scoped `[profile.dev.package]` entries for `kaspa-lthash`, `sha3` and `keccak` —
-mirroring what it already does for `kaspa-muhash` and `blake2b_simd`. `debug_assert!` and
+carries a scoped `[profile.dev.package]` entry for `kaspa-lthash`, mirroring what it already
+does for `kaspa-muhash` and `blake2b_simd`. `debug_assert!` and
 overflow checks stay on, which is deliberate: lane arithmetic is explicitly `wrapping_*`, so a
 stray non-wrapping operation should still panic.
 
@@ -577,14 +634,14 @@ stray non-wrapping operation should still panic.
 ## Workspace layout
 
 The crate is a member of the rusty-kaspa workspace (`crypto/lthash` in the root `members`
-list). It depends only on `blake2b_simd`, `sha3` and `rand_chacha` — **no dependency on any
+list). It depends only on `blake2b_simd` and `chacha20` — **no dependency on any
 consensus crate**, so the dependency edge runs one way: `kaspa-consensus-core` and
 `kaspa-consensus` depend on it, never the reverse. That keeps the accumulator independently
 testable and reviewable.
 
-Scoped `[profile.dev.package]` entries for `kaspa-lthash`, `sha3` and `keccak` in the root
-manifest keep the test suite usable in debug builds, mirroring what the workspace already does
-for `kaspa-muhash` and `blake2b_simd`.
+A scoped `[profile.dev.package]` entry for `kaspa-lthash` in the root manifest keeps the test
+suite usable in debug builds, mirroring what the workspace already does for `kaspa-muhash` and
+`blake2b_simd`.
 
 ## References
 

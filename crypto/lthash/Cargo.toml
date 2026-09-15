@@ -12,19 +12,25 @@ publish = false
 # Same versions the incumbent MuHash crate resolves to (see Cargo.lock at the repo root),
 # so that the primitives underneath both accumulators are literally the same code.
 blake2b_simd = "1.0.2"
-# ChaCha20 for element expansion, keyed by a Blake2b-256 seed -- the same shape the
-# incumbent MuHash uses. Both are already in this repository's dependency graph at these
-# versions, so this crate introduces no new cryptographic code. See src/expand.rs.
-rand_chacha = "0.3.1"
+# RustCrypto ChaCha20 (RFC 8439) for element expansion. Preferred over `rand_chacha` -- which
+# is what MuHash uses -- because it carries avx2/sse2/neon/soft backends where ppv-lite86 has
+# no aarch64 path at all, and measured ~10% faster here. Already in this repository's
+# dependency graph via chacha20poly1305. See src/expand.rs.
+chacha20 = "0.9.1"
 
 [dev-dependencies]
 # Same criterion version and feature set the root workspace uses (`criterion = { version =
 # "0.5.1", default-features = false }`), so the LtHash and MuHash benches are measured by
 # identical harness code.
 criterion = { version = "0.5.1", default-features = false }
+# Bench/test-only: recompute a digest independently of the crate's own constants.
+blake2b_simd = "1.0.2"
 proptest = "1"
 rand = "0.8"
 rand_chacha = "0.3.1"
+# Bench-only: lets `cargo bench` price cSHAKE256 and TurboSHAKE256 against the shipping
+# expansion in a single run. The library itself does not depend on sha3.
+sha3.workspace = true
 
 [[bench]]
 name = "bench"

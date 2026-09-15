@@ -906,6 +906,10 @@ fn shadow_lthash_history_row(
         "incremental_digest": drifted.then(|| stored.digest_hex()),
         // Recorded so rows can never be silently compared across a parameter change.
         "params": { "lanes": LtHashParams::default().lanes(), "lane_bits": LtHashParams::default().lane_bits() },
+        // Likewise across an expansion change: identical params with a different element
+        // expansion produce entirely different values, and nothing in a digest reveals which
+        // construction produced it. Rows whose `construction` differs are not comparable.
+        "construction": kaspa_lthash::expand::CONSTRUCTION,
         "recorded_at_ms": recorded_at_ms,
     }))
 }
@@ -913,6 +917,17 @@ fn shadow_lthash_history_row(
 #[cfg(test)]
 mod shadow_lthash_history_tests {
     use super::*;
+
+    /// A row must say which expansion produced it. Values from different constructions are
+    /// numerically unrelated, so an unlabelled history silently invites comparing rows from
+    /// either side of an expansion change.
+    #[test]
+    fn row_records_the_construction() {
+        let line = shadow_lthash_history_row(1.into(), Some(7), 3, &state(&[b"a"]), &state(&[b"a"]), 1).unwrap();
+        let row: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(row["construction"], kaspa_lthash::expand::CONSTRUCTION, "row must carry the expansion construction tag");
+        assert_eq!(row["construction"], "b2c2");
+    }
 
     fn state(elements: &[&[u8]]) -> LtHash {
         let mut h = LtHash::new(LtHashParams::default());

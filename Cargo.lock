@@ -3392,10 +3392,12 @@ name = "kaspa-lthash"
 version = "0.1.0"
 dependencies = [
  "blake2b_simd",
+ "chacha20",
  "criterion",
  "proptest",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
+ "sha3",
 ]
 
 [[package]]

@@ -72,7 +72,7 @@ expansion and multiplies into the chosen field.
 
 ## 2. The exact UTXO-entry serialization
 
-`consensus/core/src/muhash.rs:50` — this is the *only* function that turns a UTXO into
+`consensus/core/src/muhash.rs:108` — this is the *only* function that turns a UTXO into
 MuHash element bytes. Everything else routes through it.
 
 ```rust
@@ -419,7 +419,7 @@ incomparable without any test failing in the consensus crates.
 # What this survey informed
 
 The LtHash crate lives in `crypto/lthash/`, a workspace member depending only on
-`blake2b_simd`, `sha3` and `rand_chacha` (plus `proptest`/`rand` for tests) — **no dependency
+`blake2b_simd` and `chacha20` (plus `proptest`/`rand`/`sha3` for tests and benches) — **no dependency
 on any consensus crate**, so the dependency edge runs one way.
 
 ```
@@ -452,5 +452,5 @@ The findings that turned out to be load-bearing:
 * **§5, the DagKnight delta** — the encoding and diff algebra are untouched relative to the
   fork's master, so an LtHash matching `write_utxo` is directly comparable on this branch.
 
-`cargo test -p kaspa-lthash` — 41 passing (11 unit, 3 vector, 26 property, 1 doc).
+`cargo test -p kaspa-lthash` — 48 passing (14 unit, 4 construction-spec, 3 vector, 26 property, 1 doc).
 `cargo test -p kaspa-consensus-core --lib muhash` — 3 encoding-parity tests.

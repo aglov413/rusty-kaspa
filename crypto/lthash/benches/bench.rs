@@ -27,8 +27,8 @@
 //! # Attribution benches
 //!
 //! `expand_element` and `lane_add_only` split the per-element cost into its two halves:
-//! the Blake2b + ChaCha20 expansion (which scales with `N*W`) and the lane arithmetic
-//! (which scales with `N`). That split is what tells you whether a parameter change is
+//! the Blake2b-512 + dual-ChaCha20 expansion (which scales with `N*W`) and the lane
+//! arithmetic (which scales with `N`). That split is what tells you whether a parameter change is
 //! expensive, and it has no MuHash counterpart.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
@@ -100,12 +100,37 @@ fn bench_lthash(c: &mut Criterion) {
 
     // --- Cost attribution: expansion vs. lane arithmetic ---
 
-    c.bench_function("LtHash::expand_element (Blake2b + ChaCha20 + unpack)", |b| {
+    c.bench_function("LtHash::expand_element (Blake2b-512 + 2x ChaCha20 + unpack)", |b| {
         b.iter(|| expand_element(black_box(&params), black_box(&data)));
     });
 
-    c.bench_function("keystream: Blake2b-256 -> ChaCha20, 2048 B", |b| {
+    // The seed step alone, so the per-element breakdown in README.md is measured rather than
+    // derived: keystream minus this is the cost of the two ChaCha20 instances.
+    c.bench_function("seed: Blake2b-512 digest", |b| {
+        b.iter(|| kaspa_lthash::expand::element_digest(black_box(&params), black_box(&data)));
+    });
+
+    c.bench_function("keystream: shipping (B2b-512 -> 2x ChaCha20), 2048 B", |b| {
         b.iter(|| kaspa_lthash::expand::element_keystream(black_box(&params), black_box(&data)));
+    });
+
+    // cSHAKE256, restored from the reverted revision (commit fde7f656) so all three
+    // expansions are priced in one process on one machine rather than across sessions.
+    c.bench_function("keystream: cSHAKE256, 2048 B", |b| {
+        b.iter(|| cshake256_keystream(black_box(b"LtHashElement:n=1024,w=16"), black_box(&data), black_box(params.state_bytes())));
+    });
+
+    // TurboSHAKE256: Keccak-p[1600,12] rather than SHAKE's 24 rounds, same 512-bit capacity
+    // and so the same ~2^256 binding. Present in the `sha3` version the workspace already
+    // resolves, so it costs no new dependency either.
+    c.bench_function("keystream: TurboSHAKE256, 2048 B", |b| {
+        b.iter(|| turboshake256_keystream(black_box(b"LtHashElement:n=1024,w=16"), black_box(&data), black_box(params.state_bytes())));
+    });
+
+    // Apples-to-apples control: the incumbent construction with the domain precomputed rather
+    // than `format!`ed per call, matching how the candidate benches above are written.
+    c.bench_function("keystream: Blake2b-256 -> ChaCha20, precomputed domain, 2048 B", |b| {
+        b.iter(|| b2b256_chacha_keystream(black_box(b"LtHashElement:n=1024,w=16"), black_box(&data), black_box(params.state_bytes())));
     });
 
     // Regression guard on the unpack path. An early revision spent 79% of `add_element` here,
@@ -152,6 +177,49 @@ fn bench_lthash(c: &mut Criterion) {
             black_box(lthash);
         });
     }
+}
+
+/// cSHAKE256 expansion as it stood before commit `fde7f656` reverted it. Bench-only.
+fn cshake256_keystream(domain: &[u8], data: &[u8], out_len: usize) -> Vec<u8> {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    use sha3::{CShake256, CShake256Core};
+    let mut xof = CShake256::from_core(CShake256Core::new(domain));
+    xof.update(data);
+    let mut out = vec![0u8; out_len];
+    xof.finalize_xof().read(&mut out);
+    out
+}
+
+/// Blake2b-512 split across two ChaCha20 instances, each generating half the keystream.
+/// Bench-only.
+///
+/// The incumbent construction with a precomputed domain, to isolate the cost of the
+/// `format!` allocation `element_domain` performs on every call. Bench-only.
+fn b2b256_chacha_keystream(domain: &[u8], data: &[u8], out_len: usize) -> Vec<u8> {
+    use blake2b_simd::Params as Blake2bParams;
+    use rand_chacha::ChaCha20Rng;
+    use rand_chacha::rand_core::{RngCore, SeedableRng};
+    let digest = Blake2bParams::new().hash_length(32).key(domain).to_state().update(data).finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(digest.as_bytes());
+    let mut out = vec![0u8; out_len];
+    ChaCha20Rng::from_seed(seed).fill_bytes(&mut out);
+    out
+}
+
+/// TurboSHAKE256 expansion. Bench-only. TurboSHAKE takes a one-byte domain separator rather
+/// than cSHAKE's customization string, so the LtHash domain is length-prefixed into the
+/// message to keep `domain || data` unambiguous.
+fn turboshake256_keystream(domain: &[u8], data: &[u8], out_len: usize) -> Vec<u8> {
+    use sha3::digest::{ExtendableOutput, Update, XofReader};
+    use sha3::{TurboShake256, TurboShake256Core};
+    let mut xof = TurboShake256::from_core(TurboShake256Core::new(0x1F));
+    xof.update(&[u8::try_from(domain.len()).expect("domain fits in a byte")]);
+    xof.update(domain);
+    xof.update(data);
+    let mut out = vec![0u8; out_len];
+    xof.finalize_xof().read(&mut out);
+    out
 }
 
 /// A straightforward `W = 16` unpack, kept as an independent reference for the crate's
